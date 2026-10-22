@@ -59,3 +59,10 @@ def register_platforms() -> None:
     if platform_kunlunxin.is_available():
         PLATFORMS["kunlunxin"] = platform_kunlunxin
         print(f"Megatron-LM-FL Platform: kunlunxin Registered")
+
+    # Register SUPA Platform
+    from .platform_supa import PlatformSUPA
+    platform_supa = PlatformSUPA()
+    if platform_supa.is_available():
+        PLATFORMS["supa"] = platform_supa
+        print(f"Megatron-LM-FL Platform: supa Registered")

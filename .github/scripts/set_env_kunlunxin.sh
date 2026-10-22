@@ -199,11 +199,14 @@ setup_build_environment() {
 
 ci_require_env CI_TEST_SUITE
 case "$CI_TEST_SUITE" in
+  unit_group)
+    ;;
   unit)
     setup_unit_environment
     ;;
   functional)
     ci_setup_functional_environment
+    ci_validate_qwen_assets /home/gitlab-runner/data /home/gitlab-runner/tokenizers
     install_kunlunxin_python_config_shim
     install_kunlunxin_functional_dependencies
     configure_kunlunxin_runtime
