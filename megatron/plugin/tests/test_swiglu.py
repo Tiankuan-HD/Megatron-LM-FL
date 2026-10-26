@@ -34,7 +34,11 @@ def dispatch(monkeypatch):
     def reference():
         saved = dict(decorators._plugin_impl_cache)
         saved_original = set(decorators._original_impl_cache)
-        primitives = (core.swiglu.__wrapped__, core.swiglu_back.__wrapped__)
+        primitives = (
+            core.swiglu.__wrapped__,
+            core.swiglu_back.__wrapped__,
+            core.weighted_swiglu_back.__wrapped__,
+        )
         for func in primitives:
             decorators._plugin_impl_cache.pop(func, None)
             decorators._original_impl_cache.add(func)
@@ -218,9 +222,47 @@ def test_core_autograd(dispatch, npu_ops, record_property, dtype, kind):
     _close(actual, expected, dtype, record_property, "output")
     for label, expected_grad in expected_grads.items():
         _close(actual_grads[label], expected_grad, dtype, record_property, label)
-    forward = 2 if kind.startswith("weighted") else 1
-    backward = int(kind != "weighted_fp32" or dtype == torch.float32)
+    forward = 1
+    backward = int(not kind.startswith("weighted"))
     assert npu_ops.counts == {"forward": forward, "backward": backward}
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("width", [65, 128, 512])
+@pytest.mark.parametrize("strided", [False, True])
+def test_weighted_backward(
+    dispatch, npu_ops, record_property, monkeypatch, dtype, width, strided
+):
+    from megatron.plugin.Ascend.fusions import weighted_swiglu_kernels as kernels
+
+    calls = []
+    original = kernels._weighted_swiglu_backward
+
+    class Counted:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append(grid)
+                return original[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(kernels, "_weighted_swiglu_backward", Counted())
+    factor = 2 if strided else 1
+    x = _sample((7, width * 2 * factor), dtype, npu_ops.device)
+    g = _sample((7, width * factor), dtype, npu_ops.device, 72)
+    weights = _sample((7, 1), torch.float32, npu_ops.device, 73)
+    if strided:
+        x, g = x[:, ::2], g[:, ::2]
+    expected = dispatch.core.weighted_swiglu_back.__wrapped__(g, x, weights)
+    actual = dispatch.core.weighted_swiglu_back(g, x, weights)
+    assert len(calls) == 1
+    for label, a, b in zip(("input_grad", "weights_grad"), actual, expected):
+        _close(a, b, dtype, record_property, label)
+    cache = dispatch.decorators._plugin_impl_cache
+    assert (
+        cache[dispatch.core.weighted_swiglu_back.__wrapped__]
+        is dispatch.native.weighted_swiglu_back
+    )
 
 
 def test_fp32_bias_promotion(dispatch, npu_ops, record_property):

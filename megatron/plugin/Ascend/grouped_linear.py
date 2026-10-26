@@ -1,6 +1,7 @@
 """Dense expert-parameter ownership in MG, grouped GEMM execution in TE-FL."""
 
 import os
+from math import prod
 
 import torch
 
@@ -79,30 +80,37 @@ def _metadata(data, groups, splits=None):
     )
 
 
-def _gemm(a, b, destination, groups, layout, a_splits=None, b_splits=None, d_splits=None):
+def _gemm(a, b, shape, groups, layout, a_splits=None, b_splits=None, d_splits=None):
     from transformer_engine.plugin import tefl
 
-    # This TE implementation evaluates beta * D, including for beta=0.
-    # Supply initialized storage rather than relying on uninitialized D.
-    alpha = torch.ones(1, dtype=torch.float32, device=destination.device)
-    beta = torch.zeros_like(alpha)
-    workspace = torch.empty(0, dtype=torch.uint8, device=destination.device)
+    from transformer_engine.pytorch.tensor.storage.grouped_tensor_storage import (
+        GroupedTensorStorage,
+    )
+
+    output = GroupedTensorStorage(
+        shape=(prod(shape[:-1]), shape[-1]),
+        dtype=a.dtype,
+        num_tensors=groups,
+        quantizer=None,
+        first_dims=d_splits,
+    )
+    workspace = torch.empty(0, dtype=torch.uint8, device=a.device)
     tefl.te_general_grouped_gemm_for_grouped_tensor(
         _metadata(a, groups, a_splits),
         layout[0] == "T",
         _metadata(b, groups, b_splits),
         layout[1] == "T",
-        _metadata(destination, groups, d_splits),
+        output,
         None,
         None,
-        alpha,
-        beta,
+        None,
+        None,
         workspace,
         workspace,
         False,
         0,
     )
-    return destination
+    return output.rowwise_data.view(shape)
 
 
 class _DenseGroupedLinear(torch.autograd.Function):
@@ -111,8 +119,15 @@ class _DenseGroupedLinear(torch.autograd.Function):
         flat = x.reshape(-1, x.shape[-1]).contiguous()
         weight = weight.contiguous()
         groups, out_features, _ = weight.shape
-        output = x.new_zeros((flat.shape[0], out_features))
-        _gemm(weight, flat, output, groups, "TN", b_splits=splits, d_splits=splits)
+        output = _gemm(
+            weight,
+            flat,
+            (flat.shape[0], out_features),
+            groups,
+            "TN",
+            b_splits=splits,
+            d_splits=splits,
+        )
         ctx.save_for_backward(flat, weight, splits)
         ctx.input_shape = x.shape
         return output.reshape(*x.shape[:-1], out_features)
@@ -127,7 +142,7 @@ class _DenseGroupedLinear(torch.autograd.Function):
             dx = _gemm(
                 weight,
                 grad_output,
-                torch.zeros_like(x),
+                x.shape,
                 groups,
                 "NN",
                 b_splits=splits,
@@ -137,7 +152,7 @@ class _DenseGroupedLinear(torch.autograd.Function):
             dw = _gemm(
                 x,
                 grad_output,
-                torch.zeros_like(weight),
+                weight.shape,
                 groups,
                 "NT",
                 a_splits=splits,

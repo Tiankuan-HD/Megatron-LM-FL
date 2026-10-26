@@ -114,6 +114,7 @@ def bias_swiglu_back(g, y, bias):
     return swiglu_back(g, y)
 
 
+@overridable
 @jit_fuser
 def weighted_swiglu_back(g, y, weights):
     input_dtype = y.dtype

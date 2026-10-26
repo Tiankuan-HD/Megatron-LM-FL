@@ -55,3 +55,30 @@ def swiglu_back(g: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     # Preserve promoted-gradient semantics by falling back for mixed dtypes
     # rather than casting a FP32 weighted gradient down to the input dtype.
     return op(g.contiguous(), y.contiguous(), dim=-1)
+
+
+def weighted_swiglu_back(g, y, weights):
+    from megatron.core.fusions.fused_bias_swiglu import weighted_swiglu_back as original
+
+    shape = (*y.shape[:-1], y.shape[-1] // 2)
+    if (
+        torch.float64 in (g.dtype, y.dtype, weights.dtype)
+        or (torch.is_grad_enabled() and any(t.requires_grad for t in (g, y, weights)))
+        or (weights.ndim > 0 and weights.shape[-1] != 1)
+        or torch.broadcast_shapes(g.shape, weights.shape, shape) != shape
+    ):
+        return original.__wrapped__(g, y, weights)
+    try:
+        from .weighted_swiglu_kernels import weighted_swiglu_backward
+    except ImportError:
+        return original.__wrapped__(g, y, weights)
+
+    promoted = torch.promote_types(g.dtype, weights.dtype)
+    native_forward = _native_op(y, "npu_swiglu") is not None
+    native_backward = (
+        _native_op(y, "npu_swiglu_backward") is not None
+        and promoted == y.dtype
+        and torch.broadcast_shapes(g.shape, weights.shape) == shape
+        and y.shape[-1] * y.element_size() % 64 == 0
+    )
+    return weighted_swiglu_backward(g, y, weights, native_forward, native_backward)

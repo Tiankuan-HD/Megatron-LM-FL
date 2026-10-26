@@ -660,6 +660,7 @@ def process_mtp_loss(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
+    compute_output_loss: Optional[Callable] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -700,20 +701,30 @@ def process_mtp_loss(
     original_num_tokens = loss_mask.sum()
 
     for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
-        if scale_logits_fn is not None:
-            mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        if compute_output_loss is None:
+            mtp_logits, _ = output_layer(
+                hidden_states_list[mtp_layer_number + 1],
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+            if scale_logits_fn is not None:
+                mtp_logits = scale_logits_fn(mtp_logits)
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        else:
+            mtp_loss = compute_output_loss(
+                hidden_states_list[mtp_layer_number + 1],
+                output_layer,
+                output_weight,
+                mtp_labels,
+                runtime_gather_output,
+                scale_logits_fn,
+            )
         mtp_loss = loss_mask * mtp_loss
         if is_training:
             # Safe divide without sync: mask numerator when num_tokens==0, divide by clamp(min=1)

@@ -32,6 +32,7 @@ from megatron.core.utils import (
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
 )
+from megatron.plugin.decorators import overridable
 
 ######## FlagScale Begin ########
 from megatron.plugin.platform import get_platform
@@ -174,6 +175,23 @@ class LanguageModule(MegatronModule):
             check_and_set_env_variable("NVTE_FLASH_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.auto)
+
+    @overridable
+    def compute_output_loss(
+        self,
+        hidden_states,
+        output_layer,
+        output_weight,
+        labels,
+        runtime_gather_output=None,
+        scale_logits_fn=None,
+    ):
+        logits, _ = output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        if scale_logits_fn is not None:
+            logits = scale_logits_fn(logits)
+        return self.compute_language_model_loss(labels, logits)
 
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)

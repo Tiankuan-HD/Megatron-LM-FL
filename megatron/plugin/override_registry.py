@@ -71,6 +71,11 @@ register(
     vendor="npu",
 )
 register(
+    target="megatron.core.fusions.fused_bias_swiglu.weighted_swiglu_back",
+    impl="megatron.plugin.Ascend.fusions.fused_bias_swiglu.weighted_swiglu_back",
+    vendor="npu",
+)
+register(
     target="megatron.core.fusions.fused_bias_swiglu.swiglu",
     impl="megatron.plugin.kunlunxin.fusions.fused_bias_swiglu.swiglu",
     vendor="kunlunxin",
@@ -198,6 +203,12 @@ register(
 # SSM - gated_delta_net (FLA kernels)
 # =============================================================================
 register(
+    target="megatron.core.ssm.gated_delta_net.GatedDeltaNet._apply_gated_norm",
+    impl="megatron.plugin.Ascend.ssm.gated_norm.apply_gated_norm",
+    vendor="npu",
+)
+
+register(
     target="megatron.core.ssm.gated_delta_net.GatedDeltaNet._normalize_qk",
     impl="megatron.plugin.Ascend.ssm.chunk_gated_delta_rule.normalize_qk",
     vendor="npu",
@@ -277,4 +288,17 @@ register(
     target="megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer._get_communication_stream",
     impl="megatron.plugin.metax.distributed.fsdp.param_and_grad_buffer._get_communication_stream",
     vendor="metax",
+)
+
+
+register(
+    target="megatron.core.tensor_parallel.layers.ColumnParallelLinear.forward",
+    impl="megatron.plugin.Ascend.fusions.linear_cross_entropy.column_parallel_linear_forward",
+    vendor="npu",
+)
+
+register(
+    target="megatron.core.models.common.language_module.language_module.LanguageModule.compute_output_loss",
+    impl="megatron.plugin.Ascend.fusions.linear_cross_entropy.compute_output_loss",
+    vendor="npu",
 )
