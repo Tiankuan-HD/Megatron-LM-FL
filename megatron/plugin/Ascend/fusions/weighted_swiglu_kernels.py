@@ -23,36 +23,38 @@ def _weighted_swiglu_backward(
 ):
     for start in range(tl.program_id(0) * BLOCK_R, ROWS, tl.num_programs(0) * BLOCK_R):
         r = start + tl.arange(0, BLOCK_R)
-        c = tl.arange(0, BLOCK_C)
-        mask = (r[:, None] < ROWS) & (c[None, :] < WIDTH)
-        a = tl.load(Y + r[:, None] * (2 * WIDTH) + c[None, :], mask, 0)
-        b = tl.load(Y + r[:, None] * (2 * WIDTH) + WIDTH + c[None, :], mask, 0)
-        g = tl.load(G + r[:, None] * WIDTH + c[None, :], mask, 0)
         w = tl.load(W + r, r < ROWS, 0).to(tl.float32)
-        af = a.to(tl.float32)
-        bf = b.to(tl.float32)
-        sigmoid = 1.0 / (1.0 + tl.exp(-af))
-        weighted = (g.to(tl.float32) * w[:, None]).to(P).to(tl.float32)
-        if NATIVE_GRAD_ROUNDING:
-            da = weighted * sigmoid * (1.0 + af * (1.0 - sigmoid)) * bf
-            db = weighted * af * sigmoid
-        else:
-            s = sigmoid.to(a.dtype).to(tl.float32)
-            complement = (1.0 - s).to(a.dtype).to(tl.float32)
-            product = (af * complement).to(a.dtype).to(tl.float32)
-            factor = (1.0 + product).to(a.dtype).to(tl.float32)
-            da = (weighted * s).to(D).to(tl.float32)
-            da = (da * factor).to(D).to(tl.float32)
-            da = da * bf
-            silu = (af * sigmoid).to(a.dtype).to(tl.float32)
-            db = weighted * silu
-        output = (af * sigmoid * bf).to(a.dtype).to(tl.float32)
-        wg = g.to(W.dtype.element_ty).to(tl.float32)
-        dw = (output * wg).to(Q).to(tl.float32)
-        dw = tl.sum(tl.where(c[None, :] < WIDTH, dw, 0.0), 1)
-        tl.store(DY + r[:, None] * (2 * WIDTH) + c[None, :], da, mask)
-        tl.store(DY + r[:, None] * (2 * WIDTH) + WIDTH + c[None, :], db, mask)
-        tl.store(DW + r, dw, r < ROWS)
+        total = tl.full((BLOCK_R,), 0, tl.float32)
+        for column in range(0, WIDTH, BLOCK_C):
+            c = column + tl.arange(0, BLOCK_C)
+            mask = (r[:, None] < ROWS) & (c[None, :] < WIDTH)
+            a = tl.load(Y + r[:, None] * (2 * WIDTH) + c[None, :], mask, 0)
+            b = tl.load(Y + r[:, None] * (2 * WIDTH) + WIDTH + c[None, :], mask, 0)
+            g = tl.load(G + r[:, None] * WIDTH + c[None, :], mask, 0)
+            af = a.to(tl.float32)
+            bf = b.to(tl.float32)
+            sigmoid = 1.0 / (1.0 + tl.exp(-af))
+            weighted = (g.to(tl.float32) * w[:, None]).to(P).to(tl.float32)
+            if NATIVE_GRAD_ROUNDING:
+                da = weighted * sigmoid * (1.0 + af * (1.0 - sigmoid)) * bf
+                db = weighted * af * sigmoid
+            else:
+                s = sigmoid.to(a.dtype).to(tl.float32)
+                complement = (1.0 - s).to(a.dtype).to(tl.float32)
+                product = (af * complement).to(a.dtype).to(tl.float32)
+                factor = (1.0 + product).to(a.dtype).to(tl.float32)
+                da = (weighted * s).to(D).to(tl.float32)
+                da = (da * factor).to(D).to(tl.float32)
+                da = da * bf
+                silu = (af * sigmoid).to(a.dtype).to(tl.float32)
+                db = weighted * silu
+            output = (af * sigmoid * bf).to(a.dtype).to(tl.float32)
+            wg = g.to(W.dtype.element_ty).to(tl.float32)
+            dw = (output * wg).to(Q).to(tl.float32)
+            total += tl.sum(tl.where(c[None, :] < WIDTH, dw, 0.0), 1)
+            tl.store(DY + r[:, None] * (2 * WIDTH) + c[None, :], da, mask)
+            tl.store(DY + r[:, None] * (2 * WIDTH) + WIDTH + c[None, :], db, mask)
+        tl.store(DW + r, total, r < ROWS)
 
 
 @lru_cache(maxsize=None)
@@ -72,7 +74,7 @@ def weighted_swiglu_backward(g, y, weights, native_grad_rounding):
     types = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
     p = torch.promote_types(g.dtype, weights.dtype)
     rows = y.numel() // y.shape[-1]
-    block_c = triton.next_power_of_2(width)
+    block_c = min(1024, triton.next_power_of_2(width))
     block_r = min(4, max(1, 2048 // block_c))
     grid = min(triton.cdiv(rows, block_r), _vector_cores(y.device.index))
     _weighted_swiglu_backward[(grid,)](
