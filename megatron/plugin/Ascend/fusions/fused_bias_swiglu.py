@@ -1,9 +1,13 @@
+# Copyright 2026 FlagOS Contributors
+"""Ascend SwiGLU overrides with Core fallbacks for unsupported inputs."""
+
 import torch
 
 _FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def _native_op(y, name):
+    """Return an available native operator for its supported input contract."""
     if not (
         y.device.type == "npu"
         and y.layout == torch.strided
@@ -20,21 +24,25 @@ def _native_op(y, name):
 
 
 def swiglu(y):
+    """Compute SwiGLU using the native operator when supported."""
     op = _native_op(y, "npu_swiglu")
     if op is None:
         from megatron.core.fusions.fused_bias_swiglu import swiglu as original
 
+        # Bypass override dispatch; calling original here would recurse.
         return original.__wrapped__(y)
     return op(y.contiguous(), dim=-1)
 
 
 def swiglu_back(g, y):
+    """Use native input gradients for matching, aligned inputs."""
     op = _native_op(y, "npu_swiglu_backward")
     if op is None or not (
         g.device == y.device
         and g.layout == torch.strided
         and g.dtype == y.dtype
         and tuple(g.shape) == (*y.shape[:-1], y.shape[-1] // 2)
+        # aclnnSwiGluGrad requires input rows aligned to 64 bytes.
         and y.shape[-1] * y.element_size() % 64 == 0
     ):
         from megatron.core.fusions.fused_bias_swiglu import swiglu_back as original
@@ -44,9 +52,11 @@ def swiglu_back(g, y):
 
 
 def weighted_swiglu_back(g, y, weights):
+    """Fuse weighted input gradients and the per-row weight-gradient reduction."""
     from megatron.core.fusions.fused_bias_swiglu import weighted_swiglu_back as original
 
     if (
+        # dw recomputes the dispatched native forward, so it must be available.
         _native_op(y, "npu_swiglu") is None
         or any(
             t.device != y.device or t.layout != torch.strided or t.dtype not in _FLOAT_DTYPES
@@ -69,6 +79,7 @@ def weighted_swiglu_back(g, y, weights):
 
     import torch_npu
 
+    # Match native backward when selectable; otherwise match Core's staged rounding.
     native_grad_rounding = (
         torch.promote_types(g.dtype, weights.dtype) == y.dtype
         and weighted_shape == shape
