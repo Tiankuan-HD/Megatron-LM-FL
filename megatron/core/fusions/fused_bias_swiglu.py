@@ -72,13 +72,15 @@ def clamped_weighted_swiglu(y, weights, clamp_value):
     dtype = y.dtype
     res = clamped_swiglu(y, clamp_value) * weights
     return res.to(dtype)
+
+
 ######## FlagScale End ########
 
 
 # gradient of tanh approximation of gelu
 # gradient of actual gelu is:
 # 0.5 * (1. + torch.erf(x * 0.70710678)) + 0.3989423 * x * torch.exp(-0.5 * x * x)
-@overridable  # FlagScale Modify
+@overridable
 @jit_fuser
 def swiglu_back(g, y):
     """Computes the gradient for the SwiGLU activation function.
@@ -161,6 +163,8 @@ def clamped_weighted_swiglu_back(g, y, weights, clamp_value):
     weights_grad = clamped_swiglu(y, clamp_value) * g.to(w_dtype)
     weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
+
+
 ######## FlagScale End ########
 
 
@@ -303,6 +307,8 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
         else:
             tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
         return tmp, wgrad, None, None
+
+
 ######## FlagScale End ########
 
 
@@ -343,6 +349,8 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
         output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input, clamp_value)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+
+
 ######## FlagScale End ########
 
 
@@ -361,6 +369,8 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False, clamp
         output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store, clamp_value)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+
+
 ######## FlagScale End ########
 
 

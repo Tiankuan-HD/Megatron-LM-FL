@@ -1,20 +1,13 @@
-# Copyright 2026 FlagOS Contributors
-"""Native NPU SwiGLU primitives with the Core implementations as fallbacks.
-
-Supported floating-point NPU inputs use the native operators when the
-NPU vendor is selected. Other inputs keep the original Core implementations.
-"""
-from typing import Callable
-
 import torch
 
+_FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-def _native_op(y: torch.Tensor, name: str) -> Callable[..., torch.Tensor] | None:
-    """Return public native operators only for the supported input contract."""
+
+def _native_op(y, name):
     if not (
         y.device.type == "npu"
         and y.layout == torch.strided
-        and y.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and y.dtype in _FLOAT_DTYPES
         and 1 <= y.ndim <= 8
         and y.numel() > 0
         and y.shape[-1] % 2 == 0
@@ -26,59 +19,60 @@ def _native_op(y: torch.Tensor, name: str) -> Callable[..., torch.Tensor] | None
     return op if callable(op) else None
 
 
-def swiglu(y: torch.Tensor) -> torch.Tensor:
-    """Apply native SiLU(gate) * value for supported 1D to 8D NPU inputs."""
+def swiglu(y):
     op = _native_op(y, "npu_swiglu")
     if op is None:
         from megatron.core.fusions.fused_bias_swiglu import swiglu as original
 
         return original.__wrapped__(y)
-    # The public torch_npu API requires contiguous input; this is a no-op
-    # for the usual contiguous activation and preserves strided-input values.
     return op(y.contiguous(), dim=-1)
 
 
-def swiglu_back(g: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Keep the existing SwiGLUFunction saved-input and gradient contract."""
+def swiglu_back(g, y):
     op = _native_op(y, "npu_swiglu_backward")
     if op is None or not (
         g.device == y.device
         and g.layout == torch.strided
         and g.dtype == y.dtype
         and tuple(g.shape) == (*y.shape[:-1], y.shape[-1] // 2)
-        # aclnnSwiGluGrad requires 64-byte aligned input rows for dim=-1.
         and y.shape[-1] * y.element_size() % 64 == 0
     ):
         from megatron.core.fusions.fused_bias_swiglu import swiglu_back as original
 
         return original.__wrapped__(g, y)
-    # Preserve promoted-gradient semantics by falling back for mixed dtypes
-    # rather than casting a FP32 weighted gradient down to the input dtype.
     return op(g.contiguous(), y.contiguous(), dim=-1)
 
 
 def weighted_swiglu_back(g, y, weights):
     from megatron.core.fusions.fused_bias_swiglu import weighted_swiglu_back as original
 
-    shape = (*y.shape[:-1], y.shape[-1] // 2)
     if (
-        torch.float64 in (g.dtype, y.dtype, weights.dtype)
+        _native_op(y, "npu_swiglu") is None
+        or any(
+            t.device != y.device or t.layout != torch.strided or t.dtype not in _FLOAT_DTYPES
+            for t in (g, weights)
+        )
         or (torch.is_grad_enabled() and any(t.requires_grad for t in (g, y, weights)))
         or (weights.ndim > 0 and weights.shape[-1] != 1)
-        or torch.broadcast_shapes(g.shape, weights.shape, shape) != shape
     ):
+        return original.__wrapped__(g, y, weights)
+    shape = (*y.shape[:-1], y.shape[-1] // 2)
+    weighted_shape = torch.broadcast_shapes(g.shape, weights.shape)
+    if torch.broadcast_shapes(weighted_shape, shape) != shape:
         return original.__wrapped__(g, y, weights)
     try:
         from .weighted_swiglu_kernels import weighted_swiglu_backward
-    except ImportError:
+    except ModuleNotFoundError as error:
+        if error.name != "triton":
+            raise
         return original.__wrapped__(g, y, weights)
 
-    promoted = torch.promote_types(g.dtype, weights.dtype)
-    native_forward = _native_op(y, "npu_swiglu") is not None
-    native_backward = (
-        _native_op(y, "npu_swiglu_backward") is not None
-        and promoted == y.dtype
-        and torch.broadcast_shapes(g.shape, weights.shape) == shape
+    import torch_npu
+
+    native_grad_rounding = (
+        torch.promote_types(g.dtype, weights.dtype) == y.dtype
+        and weighted_shape == shape
         and y.shape[-1] * y.element_size() % 64 == 0
+        and callable(getattr(torch_npu, "npu_swiglu_backward", None))
     )
-    return weighted_swiglu_backward(g, y, weights, native_forward, native_backward)
+    return weighted_swiglu_backward(g, y, weights, native_grad_rounding)

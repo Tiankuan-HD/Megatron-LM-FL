@@ -17,8 +17,7 @@ def _weighted_swiglu_backward(
     P: tl.constexpr,
     D: tl.constexpr,
     Q: tl.constexpr,
-    NATIVE_FORWARD: tl.constexpr,
-    NATIVE_BACKWARD: tl.constexpr,
+    NATIVE_GRAD_ROUNDING: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -34,7 +33,7 @@ def _weighted_swiglu_backward(
         bf = b.to(tl.float32)
         sigmoid = 1.0 / (1.0 + tl.exp(-af))
         weighted = (g.to(tl.float32) * w[:, None]).to(P).to(tl.float32)
-        if NATIVE_BACKWARD:
+        if NATIVE_GRAD_ROUNDING:
             da = weighted * sigmoid * (1.0 + af * (1.0 - sigmoid)) * bf
             db = weighted * af * sigmoid
         else:
@@ -47,14 +46,10 @@ def _weighted_swiglu_backward(
             da = da * bf
             silu = (af * sigmoid).to(a.dtype).to(tl.float32)
             db = weighted * silu
-        if NATIVE_FORWARD:
-            output = (af * sigmoid * bf).to(a.dtype).to(tl.float32)
-        else:
-            silu = (af * sigmoid).to(a.dtype).to(tl.float32)
-            output = (silu * bf).to(a.dtype).to(tl.float32)
+        output = (af * sigmoid * bf).to(a.dtype).to(tl.float32)
         wg = g.to(W.dtype.element_ty).to(tl.float32)
         dw = (output * wg).to(Q).to(tl.float32)
-        dw = tl.sum(tl.where(c[None, :] < WIDTH, dw, 0.0), 1).to(Q)
+        dw = tl.sum(tl.where(c[None, :] < WIDTH, dw, 0.0), 1)
         tl.store(DY + r[:, None] * (2 * WIDTH) + c[None, :], da, mask)
         tl.store(DY + r[:, None] * (2 * WIDTH) + WIDTH + c[None, :], db, mask)
         tl.store(DW + r, dw, r < ROWS)
@@ -66,7 +61,7 @@ def _vector_cores(device_index):
     return int(props["num_vectorcore"])
 
 
-def weighted_swiglu_backward(g, y, weights, native_forward, native_backward):
+def weighted_swiglu_backward(g, y, weights, native_grad_rounding):
     width = y.shape[-1] // 2
     shape = (*y.shape[:-1], width)
     g = g.expand(shape).contiguous()
@@ -74,14 +69,7 @@ def weighted_swiglu_backward(g, y, weights, native_forward, native_backward):
     weights = weights.expand((*y.shape[:-1], 1)).contiguous()
     dy = torch.empty_like(y)
     dw = torch.empty_like(weights)
-    if not y.numel():
-        dw.zero_()
-        return dy, dw
-    types = {
-        torch.float16: tl.float16,
-        torch.bfloat16: tl.bfloat16,
-        torch.float32: tl.float32,
-    }
+    types = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
     p = torch.promote_types(g.dtype, weights.dtype)
     rows = y.numel() // y.shape[-1]
     block_c = triton.next_power_of_2(width)
@@ -98,8 +86,7 @@ def weighted_swiglu_backward(g, y, weights, native_forward, native_backward):
         types[p],
         types[torch.promote_types(p, y.dtype)],
         types[torch.promote_types(y.dtype, weights.dtype)],
-        native_forward,
-        native_backward,
+        native_grad_rounding,
         block_r,
         block_c,
         num_warps=4,
