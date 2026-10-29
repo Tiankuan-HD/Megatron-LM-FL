@@ -12,7 +12,6 @@ Unsupported inputs retain the original FLA path.
 from __future__ import annotations
 
 import importlib
-import logging
 import os
 from functools import lru_cache
 from types import SimpleNamespace
@@ -20,59 +19,31 @@ from typing import Optional, Tuple
 
 import torch
 
-logger = logging.getLogger(__name__)
-
 # Head dim the AscendC GDN kernels are built for.
 _SUPPORTED_HEAD_DIM = 128
 # Chunk size the AscendC GDN kernels are built for.
 _SUPPORTED_CHUNK_SIZE = 64
 
 
-def _fla_original_chunk_gated_delta_rule():
-    """Return the original FLA implementation for unsupported inputs."""
+def _optional_module(name):
+    """Return None only when the optional FLA-NPU package is absent."""
     try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule as original
-
-        return original
-    except ImportError as e:  # pragma: no cover - depends on site-packages
-        logger.warning(f"[GDN] FLA fallback unavailable: {e}")
+        return importlib.import_module(name)
+    except ModuleNotFoundError as error:
+        if error.name != "fla_npu":
+            raise
         return None
 
 
-def _fla_original_l2norm():
-    """Return FLA's own ``l2norm``, or None when unavailable."""
-    try:
-        from fla.modules.l2norm import l2norm as original
+def l2norm(x, eps=1e-6, output_dtype=None):
+    """Normalize NPU inputs with FLA-NPU and retain FLA elsewhere."""
+    # FLA-NPU's small-width backward processes complete tiles of 16 rows only.
+    if x.device.type == "npu" and (x.shape[-1] > 512 or x.numel() // x.shape[-1] % 16 == 0):
+        ops = _optional_module("fla_npu.ops.triton")
+        if ops is not None:
+            return ops.l2norm(x, eps=eps, output_dtype=output_dtype)
+    from fla.modules.l2norm import l2norm as original
 
-        return original
-    except ImportError as e:  # pragma: no cover - depends on site-packages
-        logger.warning(f"[GDN] FLA l2norm fallback unavailable: {e}")
-        return None
-
-
-def l2norm(
-    x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
-) -> torch.Tensor:
-    """L2 normalization over the last axis, matching FLA's signature exactly.
-
-    ``fla_npu.ops.triton.l2norm`` takes the same ``(x, eps, output_dtype)``
-    arguments as ``fla.modules.l2norm.l2norm``, so this is a straight swap on
-    NPU tensors and a delegation to FLA everywhere else.
-    """
-    if x.device.type == "npu":
-        try:
-            from fla_npu.ops.triton import l2norm as npu_l2norm
-
-        except ImportError as e:
-            logger.warning(f"[GDN] fla_npu l2norm unavailable, using FLA: {e}")
-        else:
-            return npu_l2norm(x, eps=eps, output_dtype=output_dtype)
-
-    original = _fla_original_l2norm()
-    if original is None:
-        raise RuntimeError(
-            "l2norm requires either fla_npu (on NPU) or FLA, but neither is importable."
-        )
     return original(x, eps=eps, output_dtype=output_dtype)
 
 
@@ -86,12 +57,7 @@ def _npu_kernels_support(
     output_final_state: bool,
     cu_seqlens: Optional[torch.Tensor],
 ) -> bool:
-    """Report whether the AscendC kernels cover this input.
-
-    Checked before any kernel launches so an unsupported case costs nothing but
-    a fallback.  Variable-length (``cu_seqlens``) input is deliberately excluded
-    for now: the kernels accept it but that path is unverified on this stack.
-    """
+    """Check the dense, head-128 training contract of the AscendC kernels."""
     if q.device.type != "npu":
         return False
     if any(t.device != q.device for t in (k, v, g, beta)):
@@ -119,16 +85,6 @@ def _npu_kernels_support(
     return True
 
 
-def _runtime_available() -> bool:
-    """Check the fla_npu operator set is loaded, without launching kernels."""
-    try:
-        _load_kernels()
-        return hasattr(torch, "npu") and torch.npu.is_available()
-    except (ImportError, RuntimeError, OSError) as e:
-        logger.warning(f"[GDN] Runtime validation failed: {e}")
-        return False
-
-
 def chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -142,26 +98,16 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Chunked gated delta rule on Ascend NPU, matching FLA's signature.
-
-    Falls back to FLA for anything the AscendC kernels do not cover.  Kernel
-    execution errors propagate rather than silently becoming a fallback result,
-    so a broken kernel is visible instead of being masked by a slow path.
-
-    ``head_first=True`` is deprecated in FLA and means BHSD input; the AscendC
-    path assumes BSHD, so that case is handed back to FLA unchanged.
-    """
+    """Run supported dense inputs on Ascend; delegate other inputs to FLA."""
     supported = not head_first and _npu_kernels_support(
         q, k, v, g, beta, initial_state, output_final_state, cu_seqlens
     )
 
-    if not supported or not _runtime_available():
-        original = _fla_original_chunk_gated_delta_rule()
-        if original is None:
-            raise RuntimeError(
-                "chunk_gated_delta_rule: input is unsupported by the Ascend kernels "
-                "and FLA is not importable for fallback."
-            )
+    if supported:
+        supported = _optional_module("fla_npu") is not None
+    if not supported:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule as original
+
         return original(
             q=q,
             k=k,
@@ -176,18 +122,17 @@ def chunk_gated_delta_rule(
             head_first=head_first,
         )
 
+    if use_qk_l2norm_in_kernel:
+        q, k = l2norm(q), l2norm(k)
     # BSHD -> BHSD for q/k/v; g and beta stay BSH.
-    output, final_state = flash_gated_delta_rule(
-        q=q.transpose(1, 2).contiguous(),
-        k=k.transpose(1, 2).contiguous(),
-        v=v.transpose(1, 2).contiguous(),
-        g=g.contiguous(),
-        beta=beta.contiguous(),
-        scale=scale,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    return _get_gdn_function().apply(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).contiguous(),
+        g.contiguous(),
+        beta.contiguous(),
+        float(scale) if scale is not None else k.shape[-1] ** -0.5,
     )
-
-    return output.contiguous(), final_state
 
 
 def normalize_qk(self, x):
@@ -203,46 +148,10 @@ def gated_delta_rule(self, q, k, v, **kwargs):
 @lru_cache(maxsize=1)
 def _load_kernels():
     """Load optional kernels on first use; failed loads remain retryable."""
-    kernels = {}
-    module = importlib.import_module("fla_npu.ops.ascendc")
-    for alias, name in (
-        ("ascendc_chunk_bwd_dqkwg", "chunk_bwd_dqkwg"),
-        ("ascendc_chunk_bwd_dv_local", "chunk_bwd_dv_local"),
-        ("ascendc_chunk_fwd_o", "chunk_fwd_o"),
-        ("ascendc_chunk_gated_delta_rule_bwd_dhu", "chunk_gated_delta_rule_bwd_dhu"),
-        ("ascendc_chunk_gated_delta_rule_fwd_h", "chunk_gated_delta_rule_fwd_h"),
-        ("ascendc_prepare_wy_repr_bwd_da", "prepare_wy_repr_bwd_da"),
-        ("ascendc_prepare_wy_repr_bwd_full", "prepare_wy_repr_bwd_full"),
-        ("ascendc_recompute_w_u_fwd", "recompute_w_u_fwd"),
-        ("ascendc_solve_tri", "solve_tri"),
-    ):
-        kernel = getattr(module, name, None)
-        if not callable(kernel):
-            raise ImportError(f"Missing GDN kernel: {module.__name__}.{name}")
-        kernels[alias] = kernel
-    module = importlib.import_module("fla_npu.ops.triton")
-    for alias, name in (
-        ("autocast_custom_bwd", "autocast_custom_bwd"),
-        ("autocast_custom_fwd", "autocast_custom_fwd"),
-        ("chunk_local_cumsum", "chunk_local_cumsum"),
-        ("chunk_scaled_dot_kkt_fwd", "chunk_scaled_dot_kkt_fwd"),
-        ("input_guard", "input_guard"),
-        ("l2norm_bwd", "l2norm_bwd"),
-        ("l2norm_fwd", "l2norm_fwd"),
-        ("solve_tril_npu", "solve_tril_npu"),
-    ):
-        kernel = getattr(module, name, None)
-        if not callable(kernel):
-            raise ImportError(f"Missing GDN kernel: {module.__name__}.{name}")
-        kernels[alias] = kernel
-    return SimpleNamespace(**kernels)
-
-
-def solve_tri_ascendc(A: torch.Tensor, output_dtype: torch.dtype = torch.float) -> torch.Tensor:
-    """Solve triangular system using AscendC."""
-    ops = _load_kernels()
-    A_in = A.to(output_dtype).contiguous()
-    return ops.ascendc_solve_tri(A_in, layout="bsnd")
+    return SimpleNamespace(
+        ascendc=importlib.import_module("fla_npu.ops.ascendc"),
+        triton=importlib.import_module("fla_npu.ops.triton"),
+    )
 
 
 def solve_tri(A: torch.Tensor, output_dtype: torch.dtype) -> torch.Tensor:
@@ -250,15 +159,14 @@ def solve_tri(A: torch.Tensor, output_dtype: torch.dtype) -> torch.Tensor:
     ops = _load_kernels()
     backend = os.getenv("FLA_NPU_GDN_SOLVE_TRI_BACKEND", "ascendc").strip().lower()
     if backend == "ascendc":
-        return solve_tri_ascendc(A, output_dtype=output_dtype)
-    elif backend == "triton":
-        return ops.solve_tril_npu(
+        return ops.ascendc.solve_tri(A.to(output_dtype).contiguous(), layout="bsnd")
+    if backend == "triton":
+        return ops.triton.solve_tril_npu(
             A=A, cu_seqlens=None, chunk_indices_out=None, output_dtype=output_dtype
         )
-    else:
-        raise ValueError(
-            f"FLA_NPU_GDN_SOLVE_TRI_BACKEND must be 'ascendc' or 'triton', got {backend!r}"
-        )
+    raise ValueError(
+        f"FLA_NPU_GDN_SOLVE_TRI_BACKEND must be 'ascendc' or 'triton', got {backend!r}"
+    )
 
 
 def recompute_w_u(
@@ -266,10 +174,9 @@ def recompute_w_u(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Recompute W and U from K, V, beta, A."""
     ops = _load_kernels()
-    w, u = ops.ascendc_recompute_w_u_fwd(
+    return ops.ascendc.recompute_w_u_fwd(
         k, v, beta, A, _SUPPORTED_CHUNK_SIZE, g=g, gk=None, cu_seqlens=None, chunk_indices=None
     )
-    return (w, u)
 
 
 def flash_chunk_gated_delta_rule_fwd(
@@ -282,14 +189,14 @@ def flash_chunk_gated_delta_rule_fwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dense recurrence: cumulative gates, WY representation, state, then output."""
     ops = _load_kernels()
-    g = ops.chunk_local_cumsum(
+    g = ops.triton.chunk_local_cumsum(
         g,
         chunk_size=_SUPPORTED_CHUNK_SIZE,
         cu_seqlens=None,
         chunk_indices_out=None,
         head_first=False,
     )
-    A = ops.chunk_scaled_dot_kkt_fwd(
+    A = ops.triton.chunk_scaled_dot_kkt_fwd(
         k=k,
         g=g,
         beta=beta,
@@ -303,7 +210,7 @@ def flash_chunk_gated_delta_rule_fwd(
     beta = beta.transpose(1, 2).contiguous().float()
     A = A.transpose(1, 2).contiguous()
     w, u = recompute_w_u(k, v, beta, A, g)
-    h, v_new, _ = ops.ascendc_chunk_gated_delta_rule_fwd_h(
+    h, v_new, _ = ops.ascendc.chunk_gated_delta_rule_fwd_h(
         k,
         w,
         u,
@@ -315,7 +222,7 @@ def flash_chunk_gated_delta_rule_fwd(
         cu_seqlens=None,
         chunk_indices=None,
     )
-    o = ops.ascendc_chunk_fwd_o(
+    o = ops.ascendc.chunk_fwd_o(
         q,
         k,
         v_new,
@@ -330,7 +237,7 @@ def flash_chunk_gated_delta_rule_fwd(
     )
     g = g.transpose(1, 2).contiguous()
     o = o.transpose(1, 2).contiguous()
-    return (g, o, A)
+    return g, o, A
 
 
 def flash_chunk_gated_delta_rule_bwd(
@@ -349,7 +256,7 @@ def flash_chunk_gated_delta_rule_bwd(
     beta = beta.transpose(1, 2).contiguous().float()
     w, u = recompute_w_u(k, v, beta, A, g)
     do = do.transpose(1, 2).contiguous()
-    h, v_new, _ = ops.ascendc_chunk_gated_delta_rule_fwd_h(
+    h, v_new, _ = ops.ascendc.chunk_gated_delta_rule_fwd_h(
         k,
         w,
         u,
@@ -361,7 +268,7 @@ def flash_chunk_gated_delta_rule_bwd(
         cu_seqlens=None,
         chunk_indices=None,
     )
-    dv = ops.ascendc_chunk_bwd_dv_local(
+    dv = ops.ascendc.chunk_bwd_dv_local(
         q,
         k,
         do,
@@ -373,7 +280,7 @@ def flash_chunk_gated_delta_rule_bwd(
         cu_seqlens=None,
         chunk_indices=None,
     )
-    dh, _, dv = ops.ascendc_chunk_gated_delta_rule_bwd_dhu(
+    dh, _, dv = ops.ascendc.chunk_gated_delta_rule_bwd_dhu(
         q,
         k,
         w,
@@ -390,7 +297,7 @@ def flash_chunk_gated_delta_rule_bwd(
         use_exp2=False,
         transpose_state_layout=False,
     )
-    dq, dk, dw, dg = ops.ascendc_chunk_bwd_dqkwg(
+    dq, dk, dw, dg = ops.ascendc.chunk_bwd_dqkwg(
         q,
         k,
         v_new,
@@ -408,19 +315,19 @@ def flash_chunk_gated_delta_rule_bwd(
         use_exp2=False,
         transpose_state_layout=False,
     )
-    dA = ops.ascendc_prepare_wy_repr_bwd_da(
+    dA = ops.ascendc.prepare_wy_repr_bwd_da(
         k,
         v,
-        beta.float(),
+        beta,
         A,
         dw,
         dv,
-        g.float(),
+        g,
         chunk_size=_SUPPORTED_CHUNK_SIZE,
         cu_seqlens=None,
         chunk_indices=None,
     )
-    dk2, dv, db, dg2 = ops.ascendc_prepare_wy_repr_bwd_full(
+    dk2, dv, db, dg2 = ops.ascendc.prepare_wy_repr_bwd_full(
         k, v, beta, A, dA, dw, dv, g, _SUPPORTED_CHUNK_SIZE, cu_seqlens=None, chunk_indices=None
     )
     db = db.transpose(1, 2).contiguous()
@@ -428,7 +335,7 @@ def flash_chunk_gated_delta_rule_bwd(
     dg = dg.transpose(1, 2).contiguous()
     dk.add_(dk2)
     dg.add_(dg2)
-    dg = ops.chunk_local_cumsum(
+    dg = ops.triton.chunk_local_cumsum(
         dg,
         chunk_size=_SUPPORTED_CHUNK_SIZE,
         reverse=True,
@@ -436,7 +343,7 @@ def flash_chunk_gated_delta_rule_bwd(
         chunk_indices_out=None,
         head_first=False,
     )
-    return (dq, dk, dv, db, dg)
+    return dq, dk, dv, db, dg
 
 
 @lru_cache(maxsize=1)
@@ -447,8 +354,8 @@ def _get_gdn_function():
         """Autograd function for GDN with complete forward/backward."""
 
         @staticmethod
-        @ops.input_guard
-        @ops.autocast_custom_fwd
+        @ops.triton.input_guard
+        @ops.triton.autocast_custom_fwd
         def forward(
             ctx,
             q: torch.Tensor,
@@ -457,32 +364,20 @@ def _get_gdn_function():
             g: torch.Tensor,
             beta: torch.Tensor,
             scale: float,
-            use_qk_l2norm_in_kernel: bool = False,
         ):
-            if use_qk_l2norm_in_kernel:
-                q, q_rstd = ops.l2norm_fwd(q)
-                k, k_rstd = ops.l2norm_fwd(k)
-            else:
-                q_rstd, k_rstd = (None, None)
             g, o, A = flash_chunk_gated_delta_rule_fwd(q=q, k=k, v=v, g=g, beta=beta, scale=scale)
             ctx.save_for_backward(q, k, v, g, beta, A)
-            ctx.q_rstd = q_rstd
-            ctx.k_rstd = k_rstd
             ctx.scale = scale
-            ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
             return (o.to(q.dtype), None)
 
         @staticmethod
-        @ops.input_guard
-        @ops.autocast_custom_bwd
+        @ops.triton.input_guard
+        @ops.triton.autocast_custom_bwd
         def backward(ctx, do: torch.Tensor, dht: Optional[torch.Tensor]):
             q, k, v, g, beta, A = ctx.saved_tensors
             dq, dk, dv, db, dg = flash_chunk_gated_delta_rule_bwd(
                 q=q, k=k, v=v, g=g, beta=beta, A=A, scale=ctx.scale, do=do
             )
-            if ctx.use_qk_l2norm_in_kernel:
-                dq = ops.l2norm_bwd(q, ctx.q_rstd, dq)
-                dk = ops.l2norm_bwd(k, ctx.k_rstd, dk)
             return (
                 dq.to(q.dtype),
                 dk.to(k.dtype),
@@ -490,30 +385,6 @@ def _get_gdn_function():
                 dg.to(g.dtype),
                 db.to(beta.dtype),
                 None,
-                None,
             )
 
     return ChunkGatedDeltaRuleFunction
-
-
-def flash_gated_delta_rule(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: Optional[float] = None,
-    use_qk_l2norm_in_kernel: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Main entry point for GDN.
-
-    Internal dense-only entry; the adapter validates inputs before calling.
-    Expects BHSD layout for q, k, v and BSH for g, beta.
-    Returns output in BSHD layout.
-    """
-    if scale is None:
-        scale = k.shape[-1] ** (-0.5)
-    o, final_state = _get_gdn_function().apply(
-        q, k, v, g, beta, float(scale), use_qk_l2norm_in_kernel
-    )
-    return (o, final_state)
