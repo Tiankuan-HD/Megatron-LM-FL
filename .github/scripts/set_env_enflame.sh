@@ -60,6 +60,11 @@ PYEOF
 }
 
 configure_enflame_runtime() {
+  # torch_gcu rewrites the default group to ECCL, but subgroup enumeration
+  # calls c10d directly. Use ECCL explicitly to avoid NCCL initialization
+  # failures that leave process-group counters inconsistent across ranks.
+  ci_export_env DISTRIBUTED_BACKEND eccl
+
   validate_enflame_torch
   validate_enflame_capacity
 }
@@ -130,13 +135,30 @@ setup_build_environment() {
 ci_require_env CI_TEST_SUITE
 
 case "$CI_TEST_SUITE" in
+  unit_group)
+    ;;
   unit)
     setup_unit_environment
     ;;
   functional)
     validate_enflame_torch
-    ci_setup_functional_environment
+    export PIP_BREAK_SYSTEM_PACKAGES=1
+    ci_setup_functional_environment --break-system-packages
+    ci_install_local_tokenizer_dependencies
     configure_enflame_runtime
+    ci_validate_qwen_assets \
+      /home/gitlab-runner/data \
+      /home/gitlab-runner/tokenizers
+    python3 - /home/gitlab-runner/tokenizers/qwentokenizer <<'PY'
+import sys
+from transformers import AutoTokenizer
+
+path = sys.argv[1]
+tokenizer = AutoTokenizer.from_pretrained(
+    path, trust_remote_code=True, local_files_only=True
+)
+print(f"Enflame tokenizer prewarm passed: {path}; vocab={tokenizer.vocab_size}")
+PY
     ;;
   build)
     setup_build_environment

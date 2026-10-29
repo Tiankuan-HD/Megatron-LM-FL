@@ -4,20 +4,17 @@ setup_script: .github/scripts/set_env_hygon.sh
 
 # Built from the documented DTK image with FlagGems, TransformerEngine-FL, and
 # the test dependencies preinstalled, so CI setup only installs this project.
-ci_image: harbor.baai.ac.cn/flagos-dev/megatron-lm-fl:manual-20260828-hygon-dev
+ci_image: harbor.baai.ac.cn/flagscale/flagscale-train:dev-hygon-py3.10-202609152059
 
 runner_labels:
   - hg-8g-cicd-megatron
 
 # The DTK PyTorch package loads driver-side runtime libraries from /opt/hyhal.
-# Use the local runner asset set. Keep both container layouts because the
-# Hygon functional cases use the legacy /opt/data paths.
+# Use the local runner asset set.
 container_volumes:
   - /opt/hyhal:/opt/hyhal
   - /data/megatron-ci-assets-20260726/baai_datasets:/home/gitlab-runner/data
   - /data/megatron-ci-assets-20260726/baai_tokenizers:/home/gitlab-runner/tokenizers
-  - /data/megatron-ci-assets-20260726/baai_datasets:/opt/data/datasets
-  - /data/megatron-ci-assets-20260726/baai_tokenizers:/opt/data/tokenizers
 
 container_options: >-
   --ipc=host
@@ -276,6 +273,9 @@ test_matrix:
       - tests/unit_tests/models/test_hybrid_model.py
       - tests/unit_tests/models/test_hybrid_moe_model.py
       - tests/unit_tests/models/test_mamba_moe_model.py
+      # TE-FL te_general_grouped_gemm shared memory requirement (80KB) exceeds
+      # BW1000 hardware limit (64KB); same MoE grouped GEMM boundary as above.
+      - tests/unit_tests/models/test_dsa_gpt_mamba_equivalence.py
 
       # fusions
       # TE-FL FlagGems backend missing rmsnorm_bwd_add operator.
@@ -429,7 +429,7 @@ test_matrix:
         golden_environment: dev
         golden_platform: bw1000
         enable_lightweight_mode: false
-        data_path: /opt/data/datasets
+        data_path: /home/gitlab-runner/data
         gpus_per_node: 1
       - model: gpt
         test_case: qwen3_0p6b_mcore_te_tp2_pp2_benchmark_hygon
@@ -438,7 +438,7 @@ test_matrix:
         golden_environment: dev
         golden_platform: bw1000
         enable_lightweight_mode: false
-        data_path: /opt/data/datasets
+        data_path: /home/gitlab-runner/data
         # This baseline is recorded with TP2/PP2 on four devices (DP=1).
         gpus_per_node: 4
 

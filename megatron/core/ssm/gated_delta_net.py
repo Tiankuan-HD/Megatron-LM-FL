@@ -524,14 +524,17 @@ class GatedDeltaNet(MegatronModule):
 
     @overridable
     def _normalize_qk(self, x):
+        """Normalize query and key vectors using the selected backend."""
         return l2norm(x)
 
     @overridable
     def _gated_delta_rule(self, q, k, v, **kwargs):
+        """Run the recurrence selected by the model configuration."""
         return self.gated_delta_rule(q, k, v, **kwargs)
 
     @overridable
     def _causal_conv1d(self, **kwargs):
+        """Apply causal convolution with the upstream argument semantics."""
         return causal_conv1d(**kwargs)
 
     @jit_fuser

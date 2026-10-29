@@ -52,7 +52,7 @@ def causal_conv1d(
         padding=weight.shape[-1] - 1,
         groups=x.shape[-1],
     )
-    output = output[..., :x.shape[1]]
+    output = output[..., : x.shape[1]]
     if activation in ("silu", "swish"):
         output = F.silu(output)
     output = output.transpose(1, 2)

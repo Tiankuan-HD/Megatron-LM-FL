@@ -82,7 +82,17 @@ def _get_preferred_vendor() -> Optional[str]:
 
         platform = platform_manager.cur_platform
         if platform is not None:
-            return platform.device_name()
+            # platform_name(), not device_name(): override_registry entries are
+            # keyed by vendor ('kunlunxin'), while device_name() is the torch
+            # device type ('cuda' under torch_xmlir).
+            vendor = platform.platform_name()
+            if vendor == "cuda":
+                import torch
+
+                # MACA exposes CUDA devices but has its own plugin implementations.
+                if getattr(torch.version, "maca", None):
+                    return "metax"
+            return vendor
     except Exception as e:
         logger.debug(f"Failed to infer override vendor from platform: {e}")
 

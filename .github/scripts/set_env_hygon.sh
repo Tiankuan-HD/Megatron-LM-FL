@@ -79,7 +79,13 @@ configure_hygon_unit_safety() {
   cat > "$timeout_wrapper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+timeout_args=()
+# Keep sequential ranks in the group runner's process group for final cleanup.
+if [ "\${CI_TEST_SUITE:-}" = unit_group ]; then
+  timeout_args+=(--foreground)
+fi
 exec timeout \
+  "\${timeout_args[@]}" \
   --signal=TERM \
   --kill-after=30s \
   "${timeout_seconds}s" \
@@ -137,8 +143,8 @@ PY
 }
 
 prepare_hygon_functional_assets() {
-  local data_root=/opt/data/datasets
-  local tokenizer_root=/opt/data/tokenizers
+  local data_root=/home/gitlab-runner/data
+  local tokenizer_root=/home/gitlab-runner/tokenizers
   local hf_home=/tmp/hygon-huggingface
 
   ci_validate_qwen_assets "$data_root" "$tokenizer_root"
@@ -150,12 +156,15 @@ prepare_hygon_functional_assets() {
   ci_export_env TRANSFORMERS_OFFLINE 1
 
   # Populate the dynamic-module cache before torchrun starts multiple ranks.
-  python3 - <<'PY'
+  python3 - "$tokenizer_root/qwentokenizer" <<'PY'
+import sys
 from transformers import AutoTokenizer
 
-path = "/opt/data/tokenizers/qwentokenizer"
-tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-print(f"Hygon tokenizer prewarm passed: {type(tokenizer)}; vocab={tokenizer.vocab_size}")
+path = sys.argv[1]
+tokenizer = AutoTokenizer.from_pretrained(
+    path, trust_remote_code=True, local_files_only=True
+)
+print(f"Hygon tokenizer prewarm passed: {path}; vocab={tokenizer.vocab_size}")
 PY
 }
 
@@ -211,6 +220,8 @@ setup_build_environment() {
 
 ci_require_env CI_TEST_SUITE
 case "$CI_TEST_SUITE" in
+  unit_group)
+    ;;
   unit)
     setup_unit_environment
     ;;
