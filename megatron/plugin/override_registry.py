@@ -227,13 +227,6 @@ register(
 )
 
 
-# Gradient clipping: in-place scale only.
-register(
-    target="megatron.core.optimizer.clip_grads._scale_grads",
-    impl="megatron.plugin.Ascend.optimizer.clip_grads._scale_grads",
-    vendor="npu",
-)
-
 register(
     target="megatron.core.transformer.transformer_config._supports_dense_grouped_weight",
     impl="megatron.plugin.Ascend.grouped_linear.supports_dense_grouped_weight",
