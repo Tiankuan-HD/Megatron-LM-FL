@@ -66,24 +66,16 @@ def _global_stats(
     labels = tl.load(Y + rows, rows < N, other=-100)
     valid = (labels >= 0) & (labels < V * WORLD)
 
-    loss = tl.where(valid, (maximum - tl.sum(p, 0)) + tl.log(denominator), float("nan"))
-    loss = tl.where(labels == -100, 0.0, loss)
+    # Native CE masks shifted target logits, but keeps loss for out-of-vocabulary labels.
+    loss = tl.log(denominator) + tl.where(valid, maximum - tl.sum(p, 0), 0.0)
     tl.store(Norm + rows, maximum, rows < N)
     tl.store(Norm + N + rows, denominator, rows < N)
     tl.store(Loss + rows, loss, rows < N)
 
 
 @triton.jit
-def _backward_inplace(
-    X,
-    Y,
-    Norm,
-    Grad,
-    N: tl.constexpr,
-    V: tl.constexpr,
-    START: tl.constexpr,
-    WORLD: tl.constexpr,
-    C: tl.constexpr,
+def _backward_logits(
+    X, D, Y, Norm, Grad, N: tl.constexpr, V: tl.constexpr, START: tl.constexpr, C: tl.constexpr
 ):
     chunk = tl.cdiv(N, tl.num_programs(0))
     begin = tl.program_id(0) * chunk
@@ -91,12 +83,11 @@ def _backward_inplace(
     offsets = tl.arange(0, C)
     for row in tl.range(begin, end):
         ptr = X + row.to(tl.int64) * V
+        out = D + row.to(tl.int64) * V
         maximum = tl.load(Norm + row)
         denominator = tl.load(Norm + N + row)
         label = tl.load(Y + row)
         grad = tl.load(Grad + row).to(tl.float32)
-        valid = (label >= 0) & (label < V * WORLD)
-        grad = tl.where(label == -100, 0.0, tl.where(valid, grad, float("nan")))
         local_label = label - START
         has_target = (local_label >= 0) & (local_label < V)
         safe_label = tl.maximum(0, tl.minimum(local_label, V - 1))
@@ -105,13 +96,13 @@ def _backward_inplace(
         full = (V // C) * C
         for col in tl.range(0, full, C):
             values = tl.load(ptr + col + offsets).to(tl.float32)
-            tl.store(ptr + col + offsets, (tl.exp(values - maximum) / denominator) * grad)
+            tl.store(out + col + offsets, (tl.exp(values - maximum) / denominator) * grad)
         if full < V:
             indices = full + offsets
             values = tl.load(ptr + indices, indices < V, other=0.0).to(tl.float32)
-            tl.store(ptr + indices, (tl.exp(values - maximum) / denominator) * grad, indices < V)
+            tl.store(out + indices, (tl.exp(values - maximum) / denominator) * grad, indices < V)
         tl.store(
-            ptr + safe_label,
+            out + safe_label,
             (tl.exp(target_logit - maximum) / denominator - 1.0) * grad,
             has_target,
         )
@@ -123,7 +114,8 @@ def _vector_cores(device_index):
     return max(1, int(props["num_vectorcore"]))
 
 
-def local_statistics(logits, labels, rank_start):
+def local_statistics(logits: torch.Tensor, labels: torch.Tensor, rank_start: int) -> torch.Tensor:
+    """Compute FP32 row maxima, exponential sums and target logits per TP rank."""
     n, v = logits.shape
     cols = min(4096, triton.next_power_of_2(v))
     stats = torch.empty((3, n), device=logits.device, dtype=torch.float32)
@@ -134,7 +126,10 @@ def local_statistics(logits, labels, rank_start):
     return stats
 
 
-def global_statistics(stats, labels, world, vocab):
+def global_statistics(
+    stats: torch.Tensor, labels: torch.Tensor, world: int, vocab: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Combine gathered row statistics into a global normalizer and per-token loss."""
     n = labels.numel()
     norm = torch.empty((2, n), device=stats.device, dtype=torch.float32)
     loss = torch.empty((n,), device=stats.device, dtype=torch.float32)
@@ -146,10 +141,18 @@ def global_statistics(stats, labels, world, vocab):
     return norm, loss
 
 
-def backward_inplace(logits, labels, norm, grad, rank_start, world):
+def backward_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    norm: torch.Tensor,
+    grad: torch.Tensor,
+    rank_start: int,
+    out: torch.Tensor,
+) -> None:
+    """Write weighted logits gradients; out may alias temporary, unsaved logits."""
     n, v = logits.shape
     cols = min(4096, triton.next_power_of_2(v))
     if n:
-        _backward_inplace[(min(_vector_cores(logits.device.index), n),)](
-            logits, labels, norm, grad, n, v, rank_start, world, cols
+        _backward_logits[(min(_vector_cores(logits.device.index), n),)](
+            logits, out, labels, norm, grad, n, v, rank_start, cols
         )

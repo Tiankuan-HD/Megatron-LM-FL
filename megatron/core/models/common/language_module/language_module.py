@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
+from collections.abc import Callable
 from typing import Optional, Tuple
 
 import torch
@@ -179,18 +180,21 @@ class LanguageModule(MegatronModule):
     @overridable
     def compute_output_loss(
         self,
-        hidden_states,
-        output_layer,
-        output_weight,
-        labels,
-        runtime_gather_output=None,
-        scale_logits_fn=None,
-    ):
+        hidden_states: Tensor,
+        output_layer: torch.nn.Module,
+        output_weight: Tensor | None,
+        labels: Tensor | Callable[[], Tensor],
+        runtime_gather_output: bool | None = None,
+        scale_logits_fn: Callable[[Tensor], Tensor] | None = None,
+    ) -> Tensor:
+        """Compute per-token loss; callable labels are resolved after projection and scaling."""
         logits, _ = output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
         if scale_logits_fn is not None:
             logits = scale_logits_fn(logits)
+        if callable(labels):
+            labels = labels()
         return self.compute_language_model_loss(labels, logits)
 
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:

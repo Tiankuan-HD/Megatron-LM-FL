@@ -291,6 +291,7 @@ register(
 )
 
 
+# Ascend output projection and vocabulary-parallel cross entropy.
 register(
     target="megatron.core.tensor_parallel.layers.ColumnParallelLinear.forward",
     impl="megatron.plugin.Ascend.fusions.linear_cross_entropy.column_parallel_linear_forward",
