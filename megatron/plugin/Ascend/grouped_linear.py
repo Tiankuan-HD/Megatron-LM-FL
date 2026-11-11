@@ -80,7 +80,7 @@ def set_parallel_attributes(self):
         return
 
     if getattr(self, "_mg_dense_grouped_weight", False):
-        self.weight.tensor_model_parallel = True
+        self.weight.tensor_model_parallel = self.explicit_expert_comm
         self.weight.partition_dim = part_dim + 1
         self.weight.partition_stride = 1
     elif self.explicit_expert_comm:

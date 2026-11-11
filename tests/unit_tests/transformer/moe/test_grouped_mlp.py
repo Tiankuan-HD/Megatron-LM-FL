@@ -1255,6 +1255,32 @@ class TestTEGroupedMLP:
             use_cpu_initialization=False,
         )
 
+    def test_npu_dense_replicated_weights_use_tp_deduplication(self, npu_dense_config):
+        """Replicated experts must contribute to gradient statistics only once per TP group."""
+        from megatron.core import parallel_state
+        from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+
+        if Utils.world_size % 4:
+            pytest.skip("This parallel layout requires a multiple of four ranks")
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            4, 1, expert_model_parallel_size=1, expert_tensor_parallel_size=1
+        )
+        config = replace(
+            npu_dense_config,
+            tensor_model_parallel_size=4,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            sequence_parallel=True,
+        )
+        experts = MoELayer(config, self.grouped_mlp.submodules).experts
+        for linear in (experts.linear_fc1, experts.linear_fc2):
+            assert not linear.explicit_expert_comm
+            assert not linear.weight.tensor_model_parallel
+            assert param_is_not_tensor_parallel_duplicate(linear.weight) == (
+                parallel_state.get_tensor_model_parallel_rank() == 0
+            )
+
     @pytest.mark.parametrize(
         "unsupported",
         [
