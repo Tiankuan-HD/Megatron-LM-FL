@@ -82,7 +82,6 @@ def _metadata(data, groups, splits=None):
 
 def _gemm(a, b, shape, groups, layout, a_splits=None, b_splits=None, d_splits=None):
     from transformer_engine.plugin import tefl
-
     from transformer_engine.pytorch.tensor.storage.grouped_tensor_storage import (
         GroupedTensorStorage,
     )
@@ -140,24 +139,10 @@ class _DenseGroupedLinear(torch.autograd.Function):
         dx = dw = None
         if ctx.needs_input_grad[0]:
             dx = _gemm(
-                weight,
-                grad_output,
-                x.shape,
-                groups,
-                "NN",
-                b_splits=splits,
-                d_splits=splits,
+                weight, grad_output, x.shape, groups, "NN", b_splits=splits, d_splits=splits
             ).reshape(ctx.input_shape)
         if ctx.needs_input_grad[1]:
-            dw = _gemm(
-                x,
-                grad_output,
-                weight.shape,
-                groups,
-                "NT",
-                a_splits=splits,
-                b_splits=splits,
-            )
+            dw = _gemm(x, grad_output, weight.shape, groups, "NT", a_splits=splits, b_splits=splits)
         return dx, dw, None
 
 
@@ -189,3 +174,24 @@ def forward_grouped_linear(self, x, m_splits, is_first_microbatch=None):
         return _DenseGroupedLinear.apply(x, weight, splits)
     finally:
         self.end_forward()
+
+
+def set_parallel_attributes(self):
+    """Mark indexed expert weights as TP shards so they are not treated as duplicates.
+
+    When explicit_expert_comm clears TE's parallel_mode, only the grouped weight
+    receives tensor_model_parallel, so every indexed weight looks like a duplicate
+    to param_is_not_tensor_parallel_duplicate(). Gradient norm, clipping and the
+    zero count then keep the expert weights of tensor-parallel rank 0 only. The
+    other ranks do not hold copies of them: they hold another shard of each expert
+    when the expert TP size is above one, or other experts under expert parallelism.
+    """
+    from megatron.core.extensions.transformer_engine import TEGroupedLinear
+
+    TEGroupedLinear._set_parallel_attributes.__wrapped__(self)
+    if not self.explicit_expert_comm or self._original_parallel_mode not in ("column", "row"):
+        return
+    for i in range(self.num_gemms):
+        weight = getattr(self, f"weight{i}", None)
+        if weight is not None:
+            weight.tensor_model_parallel = True

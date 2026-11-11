@@ -296,3 +296,10 @@ register(
     impl="megatron.plugin.Ascend.fusions.linear_cross_entropy.compute_output_loss",
     vendor="npu",
 )
+
+# Count indexed expert weights as tensor-parallel shards in gradient statistics.
+register(
+    target="megatron.core.extensions.transformer_engine.TEGroupedLinear._set_parallel_attributes",
+    impl="megatron.plugin.Ascend.grouped_linear.set_parallel_attributes",
+    vendor="npu",
+)
