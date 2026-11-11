@@ -2251,10 +2251,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             if self.explicit_expert_comm and self._original_parallel_mode in ("column", "row"):
                 part_dim = 0 if self._original_parallel_mode == "column" else 1
-                grouped_weight = getattr(self, "weight", None)
-                if grouped_weight is not None and grouped_weight.ndim == 3:
-                    setattr(grouped_weight, "partition_dim", part_dim + 1)
-                    setattr(grouped_weight, "partition_stride", 1)
                 for i in range(self.num_gemms):
                     weight = getattr(self, f"weight{i}", None)
                     if weight is not None:
@@ -2267,15 +2263,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             if not defer_init:
                 self._set_parallel_attributes()
 
-        @overridable
+        @overridable  # FlagScale Modify
         def make_grouped_weights(self, defer_init=False):
             return super().make_grouped_weights(defer_init=defer_init)
 
-        @overridable
+        @overridable  # FlagScale Modify
         def _get_weight_tensors(self):
             return super()._get_weight_tensors()
 
-        @overridable
+        @overridable  # FlagScale Modify
         def _forward_grouped_linear(self, x, m_splits, is_first_microbatch=None):
             return super().forward(x, m_splits, is_first_microbatch=is_first_microbatch)
 
@@ -2287,6 +2283,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
+                # FlagScale Modify
                 out = self._forward_grouped_linear(x, m_splits, _is_first_microbatch)
             self.is_first_microbatch = False
 
@@ -2444,42 +2441,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 else:
                     edp_replica_id = get_pg_rank(self._pg_collection.expt_dp)
                 sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
-            # Keep the real dense parent identity for distributed optimizer state
-            # mapping. Returning only detached expert views loses that identity.
-            weight = getattr(self, "weight", None)
-            if weight is not None and type(weight) is torch.nn.Parameter and weight.ndim == 3:
-                from dataclasses import replace
-
-                from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
-
-                if singleton_local_shards:
-                    raise NotImplementedError(
-                        "Dense grouped weights require singleton_local_shards=False"
-                    )
-                shape = tuple(weight.shape)
-                templates = [
-                    replace(sharded_state_dict.pop(f"{prefix}weight{i}"), data=None)
-                    for i in range(self.num_gemms)
-                ]
-
-                def build(key, tensor, replica_id, flattened_range):
-                    if flattened_range is not None:
-                        raise NotImplementedError(
-                            "Dense grouped weight checkpoint requires fully_reshardable format"
-                        )
-                    return [
-                        replace(
-                            template, key=key, data=chunk, dtype=tensor.dtype, replica_id=replica_id
-                        )
-                        for template, chunk in zip(templates, tensor.reshape(shape).unbind(0))
-                    ]
-
-                def merge(shards):
-                    return torch.stack(shards, dim=0)
-
-                sharded_state_dict[f"{prefix}weight"] = ShardedTensorFactory(
-                    templates[0].key, weight, build, merge, templates[0].replica_id
-                )
             return sharded_state_dict
 
         def backward_dw(self):

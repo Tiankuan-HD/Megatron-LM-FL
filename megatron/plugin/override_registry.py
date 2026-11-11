@@ -227,31 +227,6 @@ register(
 )
 
 
-register(
-    target="megatron.core.transformer.transformer_config._supports_dense_grouped_weight",
-    impl="megatron.plugin.Ascend.grouped_linear.supports_dense_grouped_weight",
-    vendor="npu",
-)
-
-register(
-    target="megatron.core.extensions.transformer_engine.TEGroupedLinear.make_grouped_weights",
-    impl="megatron.plugin.Ascend.grouped_linear.make_grouped_weights",
-    vendor="npu",
-)
-
-register(
-    target="megatron.core.extensions.transformer_engine.TEGroupedLinear._get_weight_tensors",
-    impl="megatron.plugin.Ascend.grouped_linear.get_weight_tensors",
-    vendor="npu",
-)
-
-register(
-    target="megatron.core.extensions.transformer_engine.TEGroupedLinear._forward_grouped_linear",
-    impl="megatron.plugin.Ascend.grouped_linear.forward_grouped_linear",
-    vendor="npu",
-)
-
-
 # MUSA compatibility overrides follow the same lazy registration as Ascend.
 register(
     target="megatron.core.transformer.moe.moe_utils.permute",
@@ -297,9 +272,34 @@ register(
     vendor="npu",
 )
 
-# Count indexed expert weights as tensor-parallel shards in gradient statistics.
+# Ascend grouped expert parameters and GEMM execution.
 register(
     target="megatron.core.extensions.transformer_engine.TEGroupedLinear._set_parallel_attributes",
     impl="megatron.plugin.Ascend.grouped_linear.set_parallel_attributes",
+    vendor="npu",
+)
+register(
+    target="megatron.core.transformer.transformer_config._supports_dense_grouped_weight",
+    impl="megatron.plugin.Ascend.grouped_linear.supports_dense",
+    vendor="npu",
+)
+register(
+    target="megatron.core.extensions.transformer_engine.TEGroupedLinear.make_grouped_weights",
+    impl="megatron.plugin.Ascend.grouped_linear.make_grouped_weights",
+    vendor="npu",
+)
+register(
+    target="megatron.core.extensions.transformer_engine.TEGroupedLinear._get_weight_tensors",
+    impl="megatron.plugin.Ascend.grouped_linear.get_weight_tensors",
+    vendor="npu",
+)
+register(
+    target="megatron.core.extensions.transformer_engine.TEGroupedLinear._forward_grouped_linear",
+    impl="megatron.plugin.Ascend.grouped_linear.forward_grouped_linear",
+    vendor="npu",
+)
+register(
+    target="megatron.core.extensions.transformer_engine.TEGroupedLinear._sharded_state_dict_grouped",
+    impl="megatron.plugin.Ascend.grouped_linear.sharded_state_dict_grouped",
     vendor="npu",
 )

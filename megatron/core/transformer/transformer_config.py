@@ -1717,7 +1717,7 @@ class TransformerConfig(ModelParallelConfig):
             # NVIDIA/Megatron-LM#4621. Reject at construction time so users don't silently
             # train on a broken numerical path. (moe_single_grouped_bias is not gated:
             # biases aren't quantized, so they don't enter the buggy code path.)
-            dense_supported = _supports_dense_grouped_weight(self)
+            dense_supported = _supports_dense_grouped_weight(self)  # FlagScale Modify
             if not dense_supported and (
                 self.fp4 or not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8
             ):
@@ -3188,14 +3188,11 @@ class MLATransformerConfig(TransformerConfig):
             ), "Rope Fusion is not compatible with caching latents"
 
 
+######## FlagScale Begin ########
 @overridable
 def _supports_dense_grouped_weight(config):
     """Whether the selected adapter supports an unquantized parent Parameter."""
-    from transformer_engine.pytorch import GroupedLinear
+    return False
 
-    return (
-        not config.fp8
-        and not config.fp4
-        and getattr(GroupedLinear, "supports_dense_single_grouped_weight", False)
-        and not config.gradient_accumulation_fusion
-    )
+
+######## FlagScale End ########
