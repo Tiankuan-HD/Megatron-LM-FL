@@ -303,3 +303,9 @@ register(
     impl="megatron.plugin.Ascend.grouped_linear.sharded_state_dict_grouped",
     vendor="npu",
 )
+
+register(
+    target="megatron.core.transformer.experimental_attention_variant.dsa.rotate_activation",
+    impl="megatron.plugin.Ascend.transformer.experimental_attention_variant.dsa.rotate_activation",
+    vendor="npu",
+)
