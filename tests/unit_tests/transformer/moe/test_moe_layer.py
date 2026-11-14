@@ -419,7 +419,15 @@ class TestMoELayerRecompute:
 @pytest.mark.parametrize("dense_weight", [False, True])
 @pytest.mark.parametrize("recompute", [False, True])
 def test_npu_mc2_layer_matches_unfused(
-    monkeypatch, tp_size, etp_size, ep_size, deny_fusion, routing_case, dense_weight, recompute
+    monkeypatch,
+    tp_size,
+    etp_size,
+    ep_size,
+    deny_fusion,
+    routing_case,
+    dense_weight,
+    recompute,
+    clamp_value=None,
 ):
     """Compare complete expert/input/router gradients and the disabled path on NPU."""
     import copy
@@ -471,6 +479,8 @@ def test_npu_mc2_layer_matches_unfused(
             gated_linear_unit=True,
             activation_func=torch.nn.functional.silu,
             bias_activation_fusion=True,
+            activation_func_clamp_value=clamp_value,
+            moe_shared_expert_intermediate_size=512 if clamp_value is not None else None,
             bf16=True,
             params_dtype=torch.bfloat16,
             gradient_accumulation_fusion=False,
@@ -488,9 +498,13 @@ def test_npu_mc2_layer_matches_unfused(
         )
         device = get_platform().device(get_platform().current_device())
         candidate = MoELayer(config, submodules=submodules, layer_number=1).to(device)
-        reference = MoELayer(copy.deepcopy(config), submodules=submodules, layer_number=1).to(
-            device
-        )
+        reference_config = copy.deepcopy(config)
+        reference = MoELayer(reference_config, submodules=submodules, layer_number=1).to(device)
+        if clamp_value is not None:
+            with torch.no_grad():
+                for name, param in candidate.named_parameters():
+                    if "linear_fc1.weight" in name:
+                        param.mul_(100)
         if routing_case in ("skewed", "overflow"):
             with torch.no_grad():
                 weight = candidate.router.weight
@@ -551,7 +565,20 @@ def test_npu_mc2_layer_matches_unfused(
         def run(module):
             module.zero_grad(set_to_none=True)
             inp = x.detach().clone().requires_grad_()
-            with policy_context(policy):
+            with policy_context(policy), monkeypatch.context() as activation_ops:
+                if module is reference and clamp_value is not None:
+                    from megatron.core.fusions import fused_bias_swiglu as core
+                    from megatron.core.transformer import mlp
+                    from megatron.core.transformer.moe import experts
+
+                    activation_ops.setattr(
+                        experts,
+                        "weighted_bias_swiglu_impl",
+                        core.weighted_bias_swiglu_impl.__wrapped__,
+                    )
+                    activation_ops.setattr(
+                        mlp, "bias_swiglu_impl", core.bias_swiglu_impl.__wrapped__
+                    )
                 output = (
                     checkpoint(module, inp, use_reentrant=True)[0] if recompute else module(inp)[0]
                 )
@@ -577,26 +604,32 @@ def test_npu_mc2_layer_matches_unfused(
         assert bool(getattr(candidate, "_npu_moe_mc2_logged", False)) == expect_fused
         if ep_size == 2:
             assert candidate.token_dispatcher._npu_moe_counts is None
-        assert actual[2].keys() == expected[2].keys()
-        pairs = list(zip(actual[:2], expected[:2])) + [
-            (actual[2][name], expected[2][name]) for name in actual[2]
-        ]
-        for value, baseline in pairs:
-            assert torch.isfinite(value).all()
-            error = (value.float() - baseline.float()).norm() / baseline.float().norm().clamp_min(
-                1e-12
-            )
-            if expect_fused:
-                assert error.item() < 0.03
-            else:
-                torch.testing.assert_close(value, baseline, rtol=0, atol=0)
+
+        def compare(actual, expected, fused):
+            assert actual[2].keys() == expected[2].keys()
+            pairs = {
+                "output": (actual[0], expected[0]),
+                "input_grad": (actual[1], expected[1]),
+                **{name: (actual[2][name], expected[2][name]) for name in actual[2]},
+            }
+            for name, (value, baseline) in pairs.items():
+                assert torch.isfinite(value).all() and torch.isfinite(baseline).all(), name
+                if fused or clamp_value is not None:
+                    # BF16 GEMMs can amplify isolated activation-gradient rounding at cancellation.
+                    # Components compare Core directly; use a tighter norm bound without MC2.
+                    limit = 0.03 if fused else 1e-3
+                    error = (
+                        value.float() - baseline.float()
+                    ).norm() / baseline.float().norm().clamp_min(1e-12)
+                    assert error.item() < limit, f"{name}: relative L2 {error.item()} >= {limit}"
+                else:
+                    torch.testing.assert_close(value, baseline, rtol=0, atol=0, msg=name)
+
+        compare(actual, expected, expect_fused)
         with monkeypatch.context() as disabled_env:
             disabled_env.setenv("NPU_MOE_MC2", "0")
             disabled, plain = run(candidate), run(reference)
-        for value, baseline in zip(disabled[:2], plain[:2]):
-            torch.testing.assert_close(value, baseline, rtol=0, atol=0)
-        for name in disabled[2]:
-            torch.testing.assert_close(disabled[2][name], plain[2][name], rtol=0, atol=0)
+        compare(disabled, plain, False)
         with monkeypatch.context() as denied_env:
             denied_env.setenv("TE_FL_DENY_VENDORS", "NPU")
             with policy_context(policy_from_env()):
@@ -696,3 +729,27 @@ def test_npu_mc2_ddp_weight_readiness(monkeypatch, dense_weight):
                 ddp.enable_forward_pre_hook()
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+def test_npu_mc2_clamped_layer_matches_core(monkeypatch, recompute):
+    """Exercise clamp=10, routed/shared experts and every gradient against Core activation."""
+    from megatron.plugin.platform import get_platform
+
+    if get_platform().device_name() != "npu" or Utils.world_size < 8:
+        pytest.skip("Requires eight Ascend ranks")
+    from megatron.plugin.Ascend.fusions import weighted_swiglu_kernels as kernels
+
+    backward = kernels.clamped_swiglu_backward
+    calls = set()
+
+    def record_backward(grad, x, weights, limit):
+        result = backward(grad, x, weights, limit)
+        calls.add(weights is not None)
+        return result
+
+    monkeypatch.setattr(kernels, "clamped_swiglu_backward", record_backward)
+    test_npu_mc2_layer_matches_unfused(
+        monkeypatch, 1, 1, 8, False, "random", True, recompute, clamp_value=10.0
+    )
+    assert calls == {False, True}
