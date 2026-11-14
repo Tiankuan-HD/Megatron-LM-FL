@@ -1083,3 +1083,539 @@ class TestApplyRope:
 
 
 pytestmark = pytest.mark.experimental
+
+
+@pytest.mark.skipif(not hasattr(torch, 'npu'), reason='Ascend NPU required')
+class TestAscendBoundedCSA:
+    """Check tiled attention, a full-denominator loss oracle, and recomputation."""
+
+    @pytest.fixture(scope='class', autouse=True)
+    def _parallel_group(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.fixture(autouse=True)
+    def patch_hadamard_if_needed(self, monkeypatch):
+        # Use the real Ascend rotation, overriding the module's CUDA-only mock fixture.
+        from megatron.core import config as mcore_config
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+            DSAIndexerLossLoggingHelper,
+        )
+
+        cpu_rng = torch.get_rng_state()
+        npu_rng = torch.npu.get_rng_state()
+        monkeypatch.setattr(mcore_config, 'ENABLE_EXPERIMENTAL', True)
+        monkeypatch.setattr(
+            DSAIndexerLossAutoScaler, 'main_loss_backward_scale', torch.ones((), device='npu')
+        )
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, 'tracker', {})
+        torch.random.default_generator.manual_seed(123)
+        torch.npu.manual_seed(123)
+        try:
+            yield
+        finally:
+            torch.set_rng_state(cpu_rng)
+            torch.npu.set_rng_state(npu_rng)
+
+    @pytest.mark.parametrize('ratio', [0, 4, 128])
+    @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+    def test_attention_output_and_gradients(self, ratio, dtype):
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant.csa import (
+            _SparseAttention,
+        )
+
+        length = 257
+        batch, heads, dim = (1, 64, 512) if dtype == torch.bfloat16 else (2, 4, 16)
+        query = torch.randn(length, batch, heads, dim, device='npu', dtype=dtype)
+        kv = torch.randn(
+            length + (length // ratio if ratio else 0), batch, dim, device='npu', dtype=dtype
+        )
+        sink = torch.randn(heads, device='npu')
+        indices = get_window_topk_idxs(17, batch, length, query.device).clone()
+        if ratio:
+            indices = torch.cat(
+                (indices, get_compress_topk_idxs(ratio, batch, length, length, query.device)),
+                dim=-1,
+            )
+        indices[:, :, 1] = indices[:, :, 0]
+        indices[:, 0] = -1
+        references = [t.detach().clone().requires_grad_() for t in (query, kv, sink)]
+        candidates = [t.detach().clone().requires_grad_() for t in (query, kv, sink)]
+        expected = unfused_compressed_sparse_attn(*references, indices.int(), dim**-0.5)
+        actual = _SparseAttention.apply(*candidates, indices.int(), dim**-0.5)
+        upstream = torch.randn_like(expected)
+        expected.backward(upstream)
+        actual.backward(upstream)
+        tolerance = (
+            dict(atol=0.012, rtol=0.02) if dtype == torch.bfloat16 else dict(atol=2e-5, rtol=3e-4)
+        )
+        torch.testing.assert_close(actual, expected, **tolerance)
+        for candidate, reference in zip(candidates, references):
+            torch.testing.assert_close(candidate.grad, reference.grad, **tolerance)
+        assert torch.count_nonzero(actual[0]) == 0
+
+    @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize('per_token', [False, True])
+    @pytest.mark.parametrize('production_dims', [False, True])
+    @pytest.mark.parametrize('coeff', [0.0, 0.01])
+    def test_sparse_indexer_loss_and_gradients(self, dtype, per_token, production_dims, coeff):
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant.csa import (
+            _SparseIndexerLoss,
+            _window_lse,
+        )
+
+        length, batch, heads, dim, ratio = 141, 2, 5, 16, 4
+        keys = length // ratio
+        teacher_heads, teacher_dim, topk = 3, 32, 9
+        if production_dims:
+            heads, dim, teacher_heads, teacher_dim, topk = 64, 128, 64, 512, keys
+        q = torch.randn(length, batch, heads, dim, device='npu', dtype=dtype)
+        k = torch.randn(keys, batch, dim, device='npu', dtype=dtype)
+        weights = torch.randn(length, batch, heads, device='npu') * 0.1
+        teacher_q = torch.randn(
+            length, batch, teacher_heads, teacher_dim, device='npu', dtype=dtype
+        )
+        teacher_k = torch.randn(keys, batch, teacher_dim, device='npu', dtype=dtype)
+        window_k = torch.randn(length, batch, teacher_dim, device='npu', dtype=dtype)
+        window = get_window_topk_idxs(17, batch, length, q.device)
+        sink = torch.randn(teacher_heads, device='npu')
+        reference = [t.detach().cpu().double().requires_grad_() for t in (q, weights, k)]
+        candidate = [t.detach().clone().requires_grad_() for t in (q, weights, k)]
+        group = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        lse = _window_lse(teacher_q, window_k, sink, window, teacher_dim**-0.5)
+        indices, actual = _SparseIndexerLoss.apply(
+            *candidate,
+            teacher_q,
+            teacher_k,
+            topk,
+            ratio,
+            teacher_dim**-0.5,
+            coeff,
+            group.tp,
+            per_token,
+            lse,
+            True,
+        )
+        expected = _ascend_sparse_loss_oracle(
+            *reference,
+            teacher_q.cpu().double(),
+            teacher_k.cpu().double(),
+            window_k.cpu().double(),
+            sink.cpu().double(),
+            window.cpu(),
+            indices.cpu(),
+            ratio,
+            teacher_dim**-0.5,
+            coeff,
+            per_token,
+        )
+        (expected * 2.75).backward()
+        (actual * 2.75).backward()
+        tolerance = (
+            dict(atol=2e-5, rtol=0.015) if dtype == torch.bfloat16 else dict(atol=2e-7, rtol=4e-4)
+        )
+        torch.testing.assert_close(actual.cpu().double(), expected, **tolerance)
+        for result, ref in zip(candidate, reference):
+            torch.testing.assert_close(result.grad.cpu().double(), ref.grad, **tolerance)
+        assert torch.count_nonzero(candidate[0].grad[: ratio - 1]) == 0
+
+    def test_topk_across_key_tiles(self):
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            _compute_index_scores,
+        )
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant.csa import (
+            _indexer_topk,
+        )
+
+        length, ratio, count = 4113, 4, 17
+        q = torch.randn(length, 1, 3, 8, device='npu')
+        k = torch.randn(length // ratio, 1, 8, device='npu')
+        weights = torch.rand(length, 1, 3, device='npu')
+        scores = _compute_index_scores(q, weights, k)
+        positions = torch.arange(1, length + 1, device='npu')
+        scores.masked_fill_(
+            torch.arange(k.shape[0], device='npu').view(1, 1, -1)
+            >= (positions // ratio).view(1, -1, 1),
+            float('-inf'),
+        )
+        indices = _indexer_topk(q, weights, k, count, ratio)
+        torch.testing.assert_close(scores.gather(-1, indices), scores.topk(count, dim=-1).values)
+
+    @pytest.mark.parametrize('ratio', [0, 4, 128])
+    def test_real_csa_module_with_recompute(self, ratio):
+        from types import MethodType
+
+        from torch.utils.checkpoint import checkpoint
+
+        from megatron.core.models.common.embeddings import RotaryEmbedding
+
+        config = _make_mla_config(
+            hidden_size=128,
+            num_attention_heads=4,
+            v_head_dim=64,
+            csa_compress_ratios=[ratio] * 4,
+            dsa_indexer_n_heads=4,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_loss_coeff=0.01,
+            dsa_indexer_use_sparse_loss=True,
+        )
+        config.gradient_accumulation_fusion = False
+        config.apply_dsa_kernel_fusion = False
+        config.deterministic_mode = True
+        groups = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        rotary = RotaryEmbedding(
+            config.qk_pos_emb_head_dim, rotary_percent=config.rotary_percent, cp_group=groups.cp
+        )
+
+        def make_module():
+            return CompressedSparseAttention(
+                config=config,
+                submodules=_make_csa_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type='self',
+                pg_collection=groups,
+                rotary_pos_emb=rotary,
+                compress_ratio=ratio,
+            ).to('npu')
+
+        reference, candidate = make_module(), make_module()
+        candidate.load_state_dict(reference.state_dict())
+        original = CompressedSparseAttention._forward_unfused_csa
+        # Sparse CSA has corrected teacher semantics; compare eager and checkpointed
+        # execution here. The independent full-denominator oracle is checked above.
+        if ratio != 4:
+            reference._forward_unfused_csa = MethodType(original.__wrapped__, reference)
+        tensors = [
+            torch.randn(257, 1, 4, 64, device='npu', dtype=torch.bfloat16),
+            torch.randn(257, 1, 1, 64, device='npu', dtype=torch.bfloat16),
+            torch.randn(257, 1, 128, device='npu', dtype=torch.bfloat16),
+            torch.randn(257, 1, config.q_lora_rank, device='npu', dtype=torch.bfloat16),
+        ]
+        references = [t.clone().requires_grad_() for t in tensors]
+        candidates = [t.clone().requires_grad_() for t in tensors]
+
+        def run(module, q, kv, x, qr):
+            return module(query=q, key=kv, value=kv, attention_mask=None, x=x, qr=qr)
+
+        expected = run(reference, *references)
+        actual = checkpoint(lambda *args: run(candidate, *args), *candidates, use_reentrant=True)
+        upstream = torch.randn_like(expected) * 0.01
+        expected.backward(upstream)
+        actual.backward(upstream)
+        torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.025)
+        for result, ref in zip(candidates, references):
+            if ref.grad is None:
+                assert result.grad is None
+            else:
+                torch.testing.assert_close(result.grad, ref.grad, atol=0.003, rtol=0.025)
+        for (name, result), (_, ref) in zip(
+            candidate.named_parameters(), reference.named_parameters()
+        ):
+            if ref.grad is None:
+                assert result.grad is None, name
+            else:
+                torch.testing.assert_close(result.grad, ref.grad, atol=0.003, rtol=0.025, msg=name)
+
+    @pytest.mark.parametrize('grad_enabled', [False, True])
+    @pytest.mark.parametrize('unsupported', ['dense', 'tp', 'cp', 'packed'])
+    def test_unsupported_npu_configuration(self, unsupported, grad_enabled):
+        from types import SimpleNamespace
+
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant.csa import (
+            forward_unfused_csa,
+        )
+
+        one = SimpleNamespace(size=lambda: 1)
+        two = SimpleNamespace(size=lambda: 2)
+        module = SimpleNamespace(
+            training=True,
+            indexer=object(),
+            config=SimpleNamespace(dsa_indexer_use_sparse_loss=unsupported != 'dense'),
+            pg_collection=SimpleNamespace(
+                tp=two if unsupported == 'tp' else one, cp=two if unsupported == 'cp' else one
+            ),
+        )
+        query = torch.zeros(1, 1, 1, 1, device='npu')
+        packed = object() if unsupported == 'packed' else None
+        message = {'dense': 'sparse loss', 'tp': 'TP=1', 'cp': 'CP=1', 'packed': 'packed sequences'}
+        with (
+            torch.set_grad_enabled(grad_enabled),
+            pytest.raises(NotImplementedError, match=message[unsupported]),
+        ):
+            forward_unfused_csa(module, query, None, None, None, None, 0, 0, None, packed)
+
+    @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize('per_token', [False, True])
+    @pytest.mark.parametrize('sink_logit', [0.0, 80.0, 90.0, 95.0, 120.0])
+    def test_sparse_loss_extreme_sink(self, dtype, per_token, sink_logit):
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant.csa import (
+            _indexer_loss_tile,
+            _SparseIndexerLoss,
+            _window_lse,
+        )
+
+        length, ratio, dim = 13, 4, 8
+        q = torch.randn(length, 1, 2, 4, device='npu', dtype=dtype)
+        weights = torch.randn(length, 1, 2, device='npu') * 0.15
+        k = torch.randn(3, 1, 4, device='npu', dtype=dtype)
+        teacher_q = torch.randn(length, 1, 3, dim, device='npu', dtype=dtype, requires_grad=True)
+        teacher_k = torch.randn(3, 1, dim, device='npu', dtype=dtype, requires_grad=True)
+        window_k = torch.randn(length, 1, dim, device='npu', dtype=dtype, requires_grad=True)
+        sink = (torch.tensor([-1.0, 0.5, 2.0], device='npu') + sink_logit).requires_grad_()
+        window = get_window_topk_idxs(5, 1, length, q.device)
+        lse = _window_lse(teacher_q, window_k, sink, window, dim**-0.5)
+        candidate = [t.detach().clone().requires_grad_() for t in (q, weights, k)]
+        reference = [t.detach().cpu().double().requires_grad_() for t in (q, weights, k)]
+        indices, actual = _SparseIndexerLoss.apply(
+            *candidate,
+            teacher_q.detach(),
+            teacher_k.detach(),
+            3,
+            ratio,
+            dim**-0.5,
+            0.01,
+            None,
+            per_token,
+            lse,
+            True,
+        )
+        expected = _ascend_sparse_loss_oracle(
+            *reference,
+            teacher_q.detach().cpu().double(),
+            teacher_k.detach().cpu().double(),
+            window_k.detach().cpu().double(),
+            sink.detach().cpu().double(),
+            window.cpu(),
+            indices.cpu(),
+            ratio,
+            dim**-0.5,
+            0.01,
+            per_token,
+        )
+        with torch.no_grad():
+            target = _indexer_loss_tile(
+                q[:, 0],
+                weights[:, 0],
+                k[:, 0],
+                teacher_q[:, 0],
+                teacher_k[:, 0],
+                indices[0],
+                torch.arange(1, length + 1, device='npu'),
+                ratio,
+                dim**-0.5,
+                None,
+                lse[0],
+            )[3]
+        target = target.cpu()
+        assert torch.isfinite(target).all() and (target >= 0).all()
+        valid_rows = torch.arange(1, length + 1) // ratio > 0
+        torch.testing.assert_close(target.sum(dim=-1), valid_rows.float(), atol=2e-6, rtol=2e-6)
+        assert actual.item() >= -2e-7
+        (actual * 2.75).backward()
+        (expected * 2.75).backward()
+        tolerance = (
+            dict(atol=2e-5, rtol=0.015) if dtype == torch.bfloat16 else dict(atol=2e-7, rtol=4e-4)
+        )
+        torch.testing.assert_close(actual.cpu().double(), expected, **tolerance)
+        for result, ref in zip(candidate, reference):
+            torch.testing.assert_close(result.grad.cpu().double(), ref.grad, **tolerance)
+            assert torch.isfinite(result.grad).all()
+        assert all(t.grad is None for t in (teacher_q, teacher_k, window_k, sink))
+
+    def test_cpu_input_falls_back_to_core(self):
+        from types import SimpleNamespace
+
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant.csa import (
+            forward_unfused_csa,
+        )
+
+        length, heads, dim = 19, 3, 8
+        module = SimpleNamespace(
+            training=False,
+            indexer=None,
+            compress_ratio=0,
+            attn_sink=torch.randn(heads),
+            softmax_scale=dim**-0.5,
+        )
+        q = torch.randn(length, 1, heads, dim, requires_grad=True)
+        kv = torch.randn(length, 1, dim, requires_grad=True)
+        indices = get_window_topk_idxs(5, 1, length, q.device)
+        args = (module, q, q, q, kv, None, 0, length, indices, None)
+        expected, _ = CompressedSparseAttention._forward_unfused_csa.__wrapped__(*args)
+        actual, loss = forward_unfused_csa(*args)
+        assert loss is None
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        expected_grads = torch.autograd.grad(expected.sum(), (q, kv))
+        actual_grads = torch.autograd.grad(actual.sum(), (q, kv))
+        for result, reference in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+    @pytest.mark.parametrize('deterministic', [False, True])
+    @pytest.mark.parametrize('pattern', ['zero', 'ties', 'near'])
+    @pytest.mark.parametrize('count', [1, 17, 67, 70])
+    def test_topk_ties_and_boundaries(self, monkeypatch, deterministic, pattern, count):
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant import csa
+
+        monkeypatch.setattr(csa, '_QUERY_CHUNK', 7)
+        monkeypatch.setattr(csa, '_KEY_CHUNK', 32)
+        length, ratio, keys = 269, 4, 67
+        q = torch.ones(length, 1, 1, 1, device='npu', dtype=torch.bfloat16)
+        k = torch.zeros(keys, 1, 1, device='npu', dtype=torch.bfloat16)
+        if pattern == 'ties':
+            k[:, 0, 0] = (torch.arange(keys, device='npu') % 5).to(k.dtype)
+        elif pattern == 'near':
+            # Adjacent BF16 values have exact FP32 products; no artificial score epsilon.
+            k[:, 0, 0] = 1 + torch.arange(keys, device='npu').to(k.dtype) / 128
+        weights = torch.ones(length, 1, 1, device='npu')
+        indices = csa._indexer_topk(q, weights, k, count, ratio, deterministic).cpu()[0]
+        scores = k.cpu().float().view(1, -1).expand(length, -1).clone()
+        positions = torch.arange(1, length + 1) // ratio
+        scores.masked_fill_(torch.arange(keys).unsqueeze(0) >= positions.unsqueeze(1), -torch.inf)
+        size = min(count, keys)
+        torch.testing.assert_close(scores.gather(-1, indices), scores.topk(size).values)
+        assert (indices.sort(dim=-1).values.diff(dim=-1) > 0).all()
+        if deterministic:
+            expected = scores.argsort(dim=-1, descending=True, stable=True)[:, :size]
+            torch.testing.assert_close(indices, expected)
+            monkeypatch.setattr(csa, '_QUERY_CHUNK', 19)
+            monkeypatch.setattr(csa, '_KEY_CHUNK', 17)
+            again = csa._indexer_topk(q, weights, k, count, ratio, True).cpu()[0]
+            torch.testing.assert_close(again, expected)
+
+    @pytest.mark.parametrize('change', ['window', 'sink', 'extreme'])
+    def test_teacher_full_denominator(self, change):
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant.csa import (
+            _indexer_loss_tile,
+            _window_lse,
+        )
+
+        q = torch.ones(1, 1, 1, device='npu')
+        k = torch.ones(2, 1, device='npu')
+        weights = torch.ones(1, 1, device='npu')
+        teacher_q = torch.eye(2, device='npu').unsqueeze(0)
+        teacher_k = torch.eye(2, device='npu') * torch.tensor(3.0, device='npu').log()
+        window_k = torch.zeros(1, 1, 2, device='npu', requires_grad=True)
+        sink = torch.zeros(2, device='npu', requires_grad=True)
+        window = torch.zeros(1, 1, 1, device='npu', dtype=torch.long)
+        with torch.no_grad():
+            if change == 'window':
+                window_k[0, 0, 0] = torch.tensor(1000.0, device='npu').log()
+            elif change == 'sink':
+                sink[0] = torch.tensor(1000.0, device='npu').log()
+            else:
+                sink.fill_(80.0)
+        lse = _window_lse(teacher_q.unsqueeze(1), window_k, sink, window, 1.0)
+        assert not lse.requires_grad
+        target = (
+            _indexer_loss_tile(
+                q,
+                weights,
+                k,
+                teacher_q,
+                teacher_k,
+                torch.tensor([[0, 1]], device='npu'),
+                torch.tensor([8], device='npu'),
+                4,
+                1.0,
+                None,
+                lse[0],
+            )[3]
+            .cpu()
+            .double()
+        )
+        logits = torch.cat(
+            (
+                teacher_q.cpu().double() @ teacher_k.cpu().double().T,
+                teacher_q.cpu().double() @ window_k.detach().cpu().double()[0].T,
+                sink.detach().cpu().double().view(1, 2, 1),
+            ),
+            dim=-1,
+        )
+        expected = logits.softmax(dim=-1)[..., :2].sum(dim=1)
+        expected /= expected.sum(dim=-1, keepdim=True)
+        torch.testing.assert_close(target, expected, atol=2e-6, rtol=2e-5)
+        if change != 'extreme':
+            assert target[0, 0] < 0.26
+        torch.testing.assert_close(target.sum(-1), torch.ones(1, dtype=torch.float64))
+
+    @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+    def test_sparse_loss_recompute_with_ties(self, monkeypatch, dtype):
+        from torch.utils.checkpoint import checkpoint
+
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant import csa
+
+        monkeypatch.setattr(csa, '_QUERY_CHUNK', 13)
+        monkeypatch.setattr(csa, '_KEY_CHUNK', 17)
+        length, keys = 149, 37
+        q = torch.ones(length, 1, 2, 4, device='npu', dtype=dtype)
+        weights = torch.zeros(length, 1, 2, device='npu')
+        k = torch.randn(keys, 1, 4, device='npu', dtype=dtype)
+        tq = torch.randn(length, 1, 3, 8, device='npu', dtype=dtype, requires_grad=True)
+        tk = torch.randn(keys, 1, 8, device='npu', dtype=dtype, requires_grad=True)
+        wk = torch.randn(length, 1, 8, device='npu', dtype=dtype, requires_grad=True)
+        sink = torch.randn(3, device='npu', requires_grad=True)
+        window = get_window_topk_idxs(7, 1, length, q.device)
+        lse = csa._window_lse(tq, wk, sink, window, 8**-0.5)
+        eager = [t.clone().requires_grad_() for t in (q, weights, k)]
+        recomputed = [t.clone().requires_grad_() for t in (q, weights, k)]
+
+        def run(*args):
+            return csa._SparseIndexerLoss.apply(
+                *args, tq.detach(), tk.detach(), 9, 4, 8**-0.5, 0.01, None, False, lse, True
+            )
+
+        expected_indices, expected_loss = run(*eager)
+        indices, loss = checkpoint(run, *recomputed, use_reentrant=True)
+        torch.testing.assert_close(indices, expected_indices)
+        torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+        expected_loss.backward()
+        loss.backward()
+        for actual, expected in zip(recomputed, eager):
+            torch.testing.assert_close(actual.grad, expected.grad, atol=2e-7, rtol=1e-5)
+        assert all(t.grad is None for t in (tq, tk, wk, sink))
+
+
+def _ascend_sparse_loss_oracle(
+    q,
+    weights,
+    k,
+    teacher_q,
+    teacher_k,
+    window_k,
+    sink,
+    window,
+    indices,
+    ratio,
+    scale,
+    coeff,
+    per_token,
+):
+    """Small dense autograd oracle; caller supplies the selected set to isolate KL math."""
+    length, batch = q.shape[:2]
+    rows = []
+    for b in range(batch):
+        for row in range(length):
+            chosen = indices[b, row]
+            chosen = chosen[chosen < (row + 1) // ratio].long()
+            if chosen.numel() == 0:
+                continue
+            prediction = (
+                ((q[row, b] @ k[chosen, b].T).relu() * weights[row, b].unsqueeze(-1))
+                .sum(dim=0)
+                .softmax(dim=-1)
+            )
+            with torch.no_grad():
+                valid_window = window[b, row]
+                valid_window = valid_window[valid_window >= 0].long()
+                compressed = teacher_q[row, b] @ teacher_k[chosen, b].T * scale
+                local = teacher_q[row, b] @ window_k[valid_window, b].T * scale
+                logits = torch.cat((compressed, local, sink.unsqueeze(-1)), dim=-1)
+                target = logits.softmax(dim=-1)[:, : chosen.numel()].sum(dim=0)
+                target /= target.sum().clamp_min(torch.finfo(target.dtype).tiny)
+            rows.append((target * ((target + 1e-10).log() - (prediction + 1e-10).log())).sum())
+    return torch.stack(rows).sum() * (coeff if per_token else coeff / (batch * length))

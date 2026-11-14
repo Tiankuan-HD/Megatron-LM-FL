@@ -346,3 +346,11 @@ register(
     impl="megatron.plugin.Ascend.distributed.distributed_data_parallel.enable_forward_pre_hook",
     vendor="npu",
 )
+
+
+# Ascend compressed sparse attention and indexer.
+register(
+    target="megatron.core.transformer.experimental_attention_variant.csa.CompressedSparseAttention._forward_unfused_csa",
+    impl="megatron.plugin.Ascend.transformer.experimental_attention_variant.csa.forward_unfused_csa",
+    vendor="npu",
+)

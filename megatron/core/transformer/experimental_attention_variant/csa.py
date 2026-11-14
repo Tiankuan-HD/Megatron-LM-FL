@@ -25,6 +25,7 @@ from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.plugin.decorators import overridable
 
 ######## FlagScale Begin ########
 # ---------------------------------------------------------------------------
@@ -762,6 +763,7 @@ class CompressedSparseAttention(MegatronModule):
             n_compressed = 0
         return kv_full, compressed_kv, n_compressed
 
+    @overridable
     def _forward_unfused_csa(
         self,
         query: torch.Tensor,
