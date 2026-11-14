@@ -315,3 +315,34 @@ register(
     impl="megatron.plugin.Ascend.transformer.experimental_attention_variant.dsa.rotate_activation",
     vendor="npu",
 )
+
+
+# Ascend expert-parallel communication/computation fusion.
+register(
+    target="megatron.core.transformer.moe.moe_layer.MoELayer.compute_experts",
+    impl="megatron.plugin.Ascend.transformer.moe.fused_experts.compute_experts",
+    vendor="npu",
+)
+register(
+    target="megatron.core.transformer.moe.token_dispatcher.MoEAlltoAllTokenDispatcher._gather_tokens_per_expert",
+    impl="megatron.plugin.Ascend.transformer.moe.fused_experts.gather_tokens_per_expert",
+    vendor="npu",
+)
+
+register(
+    target="megatron.core.transformer.moe.moe_layer.MoELayer.preprocess",
+    impl="megatron.plugin.Ascend.transformer.moe.fused_experts.preprocess",
+    vendor="npu",
+)
+register(
+    target="megatron.core.transformer.moe.token_dispatcher.MoEAlltoAllTokenDispatcher.dispatch_preprocess",
+    impl="megatron.plugin.Ascend.transformer.moe.fused_experts.dispatch_preprocess",
+    vendor="npu",
+)
+
+# Native MC2 consumes grouped weights outside Linear.forward.
+register(
+    target="megatron.core.distributed.distributed_data_parallel.DistributedDataParallel.enable_forward_pre_hook",
+    impl="megatron.plugin.Ascend.distributed.distributed_data_parallel.enable_forward_pre_hook",
+    vendor="npu",
+)
