@@ -17,8 +17,9 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, get_current_device
 
 
 class _RouterExpertBiasModel(torch.nn.Module):
@@ -55,6 +56,8 @@ _NO_TP_DP_CP = object()
 def _router_bias_pg_collection(tp_dp_cp=_NO_TP_DP_CP):
     kwargs = {
         'tp': dist.group.WORLD,
+        'cp': dist.group.WORLD,
+        'tp_cp': dist.group.WORLD,
         'pp': dist.group.WORLD,
         'embd': None,
         'pos_embd': None,
@@ -115,6 +118,57 @@ class TestFinalizeModelGradsMoEExpertBias:
             with pytest.raises(AssertionError, match="tp_dp_cp"):
                 finalize_model_grads([model], pg_collection=pg_collection)
             assert model.finish_grad_sync_calls == 0
+
+    @pytest.mark.parametrize("layer_numbers", [(1, 2, 3), (1, 2, 3, 4), (4,)])
+    @pytest.mark.parametrize("router_mode", ["train", "eval", "disabled"])
+    def test_finalize_model_grads_with_hash_routers(self, layer_numbers, router_mode):
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=8,
+            num_attention_heads=1,
+            num_moe_experts=2,
+            actual_vocab_size=8,
+            moe_n_hash_layers=3,
+            use_cpu_initialization=True,
+            moe_router_enable_expert_bias=router_mode != "disabled",
+            moe_router_score_function="sigmoid",
+            moe_router_bias_update_rate=0.25,
+            moe_router_load_balancing_type="none",
+        )
+        device = get_current_device()
+        pg_collection = _router_bias_pg_collection(tp_dp_cp=dist.group.WORLD)
+        model = _RouterExpertBiasModel(config, torch.zeros(2, device=device))
+        model.router = torch.nn.ModuleList(
+            [
+                TopKRouter(config, pg_collection=pg_collection, layer_number=layer_number)
+                for layer_number in layer_numbers
+            ]
+        )
+        model.train(router_mode != "eval")
+
+        for step, counts in enumerate(([0.0, 2.0], [2.0, 0.0]), start=1):
+            for router in model.router:
+                if router.enable_expert_bias:
+                    router.local_tokens_per_expert.copy_(
+                        torch.tensor(counts if dist.get_rank() == 0 else [0.0, 0.0], device=device)
+                    )
+
+            finalize_model_grads([model], pg_collection=pg_collection)
+
+            for router in model.router:
+                if router.enable_expert_bias:
+                    expected_bias = torch.tensor(
+                        [0.25, -0.25] if step == 1 and router_mode == "train" else [0.0, 0.0],
+                        device=device,
+                    )
+                    torch.testing.assert_close(router.expert_bias, expected_bias)
+                    torch.testing.assert_close(
+                        router.local_tokens_per_expert, torch.zeros(2, device=device)
+                    )
+                else:
+                    assert router.expert_bias is None
+                    assert router.local_tokens_per_expert is None
+            assert model.finish_grad_sync_calls == step
 
 
 class TestAllReduceLNGrads:
