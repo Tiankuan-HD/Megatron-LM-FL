@@ -743,3 +743,402 @@ class TestDSv4HybridRopeFusion:
 
 
 pytestmark = pytest.mark.experimental
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+class TestDSv4HybridNPUUpProjectionRecompute:
+    """Exercise narrow Q-projection recomputation through the real Ascend attention path."""
+
+    @pytest.fixture(autouse=True)
+    def setup_npu(self, monkeypatch, patch_hadamard_if_needed):
+        torch_npu = pytest.importorskip("torch_npu")
+        if not torch_npu.npu.is_available():
+            pytest.skip("NPU not available")
+        from megatron.core.transformer.experimental_attention_variant import csa, dsa
+
+        # Restore the native override hidden by this file's optional CUDA-library fixture.
+        monkeypatch.setattr(csa, "rotate_activation", dsa.rotate_activation)
+        monkeypatch.setattr(dsa.DSAIndexerLossLoggingHelper, "tracker", {})
+        monkeypatch.setattr(dsa.DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        self.pg = ProcessGroupCollection.use_mpu_process_groups()
+        self.device = torch.device("npu", torch_npu.npu.current_device())
+        dsa.DSAIndexerLossAutoScaler.set_loss_scale(torch.ones((), device=self.device))
+        yield
+        Utils.destroy_model_parallel()
+
+    def _build(self, ratio, dtype=torch.bfloat16, granularity="full", native=True):
+        from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+            DSv4HybridSelfAttention,
+        )
+        from megatron.core.transformer.module import Float16Module
+
+        config = _make_config(
+            num_layers=1,
+            csa_compress_ratios=[ratio],
+            dsa_indexer_head_dim=128,
+            dsa_indexer_loss_coeff=0.1,
+            dsa_indexer_use_sparse_loss=True,
+            apply_dsa_kernel_fusion=False,
+            apply_rope_fusion=False,
+            gradient_accumulation_fusion=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            recompute_granularity=granularity,
+            recompute_method="uniform" if granularity == "full" else None,
+            recompute_num_layers=1 if granularity == "full" else None,
+            recompute_modules=["mla_up_proj"] if granularity == "selective" else [],
+        )
+        config.bf16 = dtype == torch.bfloat16
+        config.fp16 = dtype == torch.float16
+        config.params_dtype = dtype
+        attention = _build_attention(config, layer_number=1, pg_collection=self.pg).to(self.device)
+        if dtype in (torch.bfloat16, torch.float16):
+            attention = Float16Module(config, attention).module
+        if not native:
+            # The binding must also bypass the plugin during outer checkpoint replay.
+            original = DSv4HybridSelfAttention._q_up_proj_and_norm.__wrapped__
+            attention._q_up_proj_and_norm = original.__get__(attention)
+        return attention
+
+    @staticmethod
+    def _forward(attention, hidden, outer_checkpoint=False):
+        from megatron.core import tensor_parallel
+
+        def run(inputs):
+            return attention(inputs, attention_mask=None)[0]
+
+        return tensor_parallel.checkpoint(run, False, hidden) if outer_checkpoint else run(hidden)
+
+    @pytest.mark.parametrize(
+        "ratio,dtype,outer_checkpoint",
+        [(ratio, torch.bfloat16, outer) for ratio in (0, 4, 128) for outer in (False, True)]
+        + [(ratio, torch.float16, True) for ratio in (0, 128)],
+    )
+    def test_full_recompute_matches_core_after_parameter_updates(
+        self, ratio, dtype, outer_checkpoint
+    ):
+        """Match all gradients for two updates, including full reentrant checkpoint replay."""
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+        reference = self._build(ratio, dtype, native=False)
+        native = self._build(ratio, dtype)
+        native.load_state_dict(reference.state_dict())
+        hidden = torch.randn(256, 1, reference.config.hidden_size, device=self.device, dtype=dtype)
+        calls = {"reference": 0, "native": 0}
+
+        def count(name):
+            def hook(*unused):
+                calls[name] += 1
+
+            return hook
+
+        handles = [
+            reference.linear_q_up_proj.register_forward_hook(count("reference")),
+            native.linear_q_up_proj.register_forward_hook(count("native")),
+        ]
+        try:
+            for step in range(2):
+                outputs, inputs = [], []
+                for model in (reference, native):
+                    model.zero_grad(set_to_none=True)
+                    value = hidden.detach().clone().requires_grad_(True)
+                    output = self._forward(model, value, outer_checkpoint)
+                    output.float().square().mean().backward()
+                    outputs.append(output.detach())
+                    inputs.append(value.grad)
+                    assert model.recompute_up_proj is False
+                    assert model.qkv_up_checkpoint is None
+
+                torch.testing.assert_close(
+                    outputs[0], outputs[1], rtol=1e-2 if step else 0, atol=1e-5 if step else 0
+                )
+                torch.testing.assert_close(inputs[0], inputs[1], rtol=1e-2, atol=1e-5)
+                for (name, expected), (actual_name, actual) in zip(
+                    reference.named_parameters(), native.named_parameters()
+                ):
+                    assert name == actual_name
+                    assert expected.grad is not None, name
+                    assert actual.grad is not None, name
+                    assert torch.isfinite(actual.grad).all(), name
+                    torch.testing.assert_close(
+                        actual.grad, expected.grad, rtol=1e-2, atol=1e-5, msg=name
+                    )
+                    with torch.no_grad():
+                        expected.add_(expected.grad, alpha=-1e-3)
+                        actual.add_(actual.grad, alpha=-1e-3)
+        finally:
+            for handle in handles:
+                handle.remove()
+        assert calls["reference"] == 2 * (2 if outer_checkpoint else 1)
+        assert calls["native"] == 2 * (3 if outer_checkpoint else 2)
+
+    @pytest.mark.parametrize("ratio", [0, 4, 128])
+    def test_saved_query_teacher_and_duplicate_kv_storage(self, ratio, monkeypatch):
+        """Omit saved raw Q while retaining output aliases through both backward branches."""
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant import csa
+
+        # Record metadata only: keeping the projection tensor here would retain raw Q.
+        for native in (False, True):
+            attention = self._build(ratio, native=native)
+            raw_storages, saved_storages = [], []
+
+            def observe_projection(module, inputs, output):
+                raw_storages.append(output[0].untyped_storage()._cdata)
+
+            def observe_saved(tensor):
+                saved_storages.append(tensor.untyped_storage()._cdata)
+                return tensor
+
+            handle = attention.linear_q_up_proj.register_forward_hook(observe_projection)
+            q_compressed = torch.randn(
+                256,
+                1,
+                attention.config.q_lora_rank,
+                device=self.device,
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            try:
+                with torch.autograd.graph.saved_tensors_hooks(observe_saved, lambda tensor: tensor):
+                    normalized = attention._q_up_proj_and_norm(q_compressed)
+                assert len(raw_storages) == 1
+                assert (raw_storages[0] in saved_storages) is not native
+                del normalized
+            finally:
+                handle.remove()
+
+        records = []
+        get_qkv = attention.get_query_key_value_tensors
+        indexer_forward = csa._SparseIndexerLoss.forward
+        indexer_backward = csa._SparseIndexerLoss.backward
+        attention_backward = csa._SparseAttention.backward
+
+        def remember(record, name, tensor):
+            storage = tensor.untyped_storage()
+            assert storage.nbytes() > 0
+            record[name] = tensor
+            record["storage"][name] = (storage._cdata, storage.nbytes())
+            record["values"][name] = tensor.detach().clone()
+
+        def check_retained(record):
+            for name, expected_storage in record["storage"].items():
+                tensor = record[name]
+                storage = tensor.untyped_storage()
+                assert (storage._cdata, storage.nbytes()) == expected_storage
+                torch.testing.assert_close(tensor, record["values"][name], rtol=0, atol=0)
+            assert (
+                record["key"].untyped_storage()._cdata == record["value"].untyped_storage()._cdata
+            )
+            if "teacher" in record:
+                assert (
+                    record["teacher"].untyped_storage()._cdata
+                    == record["query"].untyped_storage()._cdata
+                )
+
+        def observe_qkv(*args, **kwargs):
+            result = get_qkv(*args, **kwargs)
+            if torch.is_grad_enabled():
+                query, key, value = result[:3]
+                assert key.untyped_storage()._cdata == value.untyped_storage()._cdata
+                record = {"storage": {}, "values": {}}
+                for name, tensor in (("query", query), ("key", key), ("value", value)):
+                    remember(record, name, tensor)
+                records.append(record)
+            return result
+
+        def observe_indexer_forward(ctx, *args):
+            if records:
+                teacher = args[3]
+                assert (
+                    teacher.untyped_storage()._cdata
+                    == records[-1]["query"].untyped_storage()._cdata
+                )
+                remember(records[-1], "teacher", teacher)
+            return indexer_forward(ctx, *args)
+
+        def observe_indexer_backward(ctx, *args):
+            check_retained(records[-1])
+            assert (
+                ctx.saved_tensors[3].untyped_storage()._cdata
+                == records[-1]["query"].untyped_storage()._cdata
+            )
+            records[-1]["indexer_backward"] = True
+            return indexer_backward(ctx, *args)
+
+        def observe_attention_backward(ctx, *args):
+            check_retained(records[-1])
+            assert (
+                ctx.saved_tensors[0].untyped_storage()._cdata
+                == records[-1]["query"].untyped_storage()._cdata
+            )
+            records[-1]["attention_backward"] = True
+            return attention_backward(ctx, *args)
+
+        monkeypatch.setattr(attention, "get_query_key_value_tensors", observe_qkv)
+        monkeypatch.setattr(
+            csa._SparseIndexerLoss, "forward", staticmethod(observe_indexer_forward)
+        )
+        monkeypatch.setattr(
+            csa._SparseIndexerLoss, "backward", staticmethod(observe_indexer_backward)
+        )
+        monkeypatch.setattr(
+            csa._SparseAttention, "backward", staticmethod(observe_attention_backward)
+        )
+        hidden = torch.randn(
+            256,
+            1,
+            attention.config.hidden_size,
+            device=self.device,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        self._forward(attention, hidden, outer_checkpoint=True).sum().backward()
+        assert len(records) == 1
+        check_retained(records[0])
+        assert records[0]["attention_backward"]
+        assert records[0].get("indexer_backward", False) == (ratio == 4)
+        assert ("teacher" in records[0]) == (ratio == 4)
+        assert torch.isfinite(hidden.grad).all()
+
+    @pytest.mark.parametrize("ratio", [0, 4, 128])
+    def test_existing_selective_up_projection_path(self, ratio):
+        """Preserve the original selective path and its configured recompute flag."""
+        attention = self._build(ratio, granularity="selective")
+        hidden = torch.randn(
+            256,
+            1,
+            attention.config.hidden_size,
+            device=self.device,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        calls = []
+        handle = attention.linear_q_up_proj.register_forward_hook(lambda *unused: calls.append(1))
+        try:
+            self._forward(attention, hidden).sum().backward()
+        finally:
+            handle.remove()
+        assert len(calls) == 2
+        assert attention.recompute_up_proj is True
+        assert attention.qkv_up_checkpoint is None
+        assert torch.isfinite(hidden.grad).all()
+        assert all(
+            p.grad is not None and torch.isfinite(p.grad).all() for p in attention.parameters()
+        )
+
+    @pytest.mark.parametrize("case", ["fp32", "no_grad", "eval", "not_full"])
+    def test_native_fallback_runs_original_attention(self, case, monkeypatch):
+        """Unsupported runtime modes preserve the original forward without a local checkpoint."""
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant import (
+            dsv4_hybrid_attention,
+        )
+
+        dtype = torch.float32 if case == "fp32" else torch.bfloat16
+        granularity = None if case == "not_full" else "full"
+        reference = self._build(0, dtype, granularity=granularity, native=False)
+        attention = self._build(0, dtype, granularity=granularity)
+        attention.load_state_dict(reference.state_dict())
+        reference.train(case != "eval")
+        attention.train(case != "eval")
+        hidden = torch.randn(
+            128,
+            1,
+            attention.config.hidden_size,
+            device=self.device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+
+        def unexpected_checkpoint(*args, **kwargs):
+            pytest.fail("Unsupported attention mode entered the local Q checkpoint")
+
+        monkeypatch.setattr(dsv4_hybrid_attention, "checkpoint", unexpected_checkpoint)
+        calls = []
+        handle = attention.linear_q_up_proj.register_forward_hook(lambda *unused: calls.append(1))
+        try:
+            with torch.set_grad_enabled(case != "no_grad"):
+                expected = self._forward(reference, hidden)
+                actual = self._forward(attention, hidden)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        finally:
+            handle.remove()
+        assert len(calls) == 1
+        assert attention.recompute_up_proj is False
+        assert attention.qkv_up_checkpoint is None
+
+    def test_frozen_compressed_query_preserves_projection_gradients(self):
+        """Non-reentrant recomputation also trains Q-up weights with a frozen input."""
+        reference = self._build(0, native=False)
+        native = self._build(0)
+        native.load_state_dict(reference.state_dict())
+        q_compressed = torch.randn(
+            128, 1, native.config.q_lora_rank, device=self.device, dtype=torch.bfloat16
+        )
+        calls = {"reference": 0, "native": 0}
+
+        def count(name):
+            def hook(*unused):
+                calls[name] += 1
+
+            return hook
+
+        handles = [
+            reference.linear_q_up_proj.register_forward_hook(count("reference")),
+            native.linear_q_up_proj.register_forward_hook(count("native")),
+        ]
+        try:
+            for step in range(2):
+                outputs = []
+                for model in (reference, native):
+                    model.zero_grad(set_to_none=True)
+                    output = model._q_up_proj_and_norm(q_compressed)
+                    output.float().square().mean().backward()
+                    outputs.append(output.detach())
+                torch.testing.assert_close(
+                    outputs[0], outputs[1], rtol=1e-2 if step else 0, atol=1e-5 if step else 0
+                )
+                for (name, expected), (actual_name, actual) in zip(
+                    reference.linear_q_up_proj.named_parameters(),
+                    native.linear_q_up_proj.named_parameters(),
+                ):
+                    assert name == actual_name
+                    assert expected.grad is not None, name
+                    assert actual.grad is not None, name
+                    assert torch.isfinite(actual.grad).all(), name
+                    torch.testing.assert_close(
+                        actual.grad, expected.grad, rtol=1e-2, atol=1e-5, msg=name
+                    )
+                    with torch.no_grad():
+                        expected.add_(expected.grad, alpha=-1e-3)
+                        actual.add_(actual.grad, alpha=-1e-3)
+        finally:
+            for handle in handles:
+                handle.remove()
+        assert q_compressed.grad is None
+        assert calls == {"reference": 2, "native": 4}
+
+    def test_cpu_input_delegates_without_changing_recompute_flag(self, monkeypatch):
+        """Check CPU delegation without requiring unsupported CPU execution of TE attention."""
+        from types import SimpleNamespace
+
+        from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+            DSv4HybridSelfAttention,
+        )
+        from megatron.plugin.Ascend.transformer.experimental_attention_variant.dsv4_hybrid_attention import (
+            q_up_proj_and_norm,
+        )
+
+        attention = SimpleNamespace(config=SimpleNamespace(), recompute_up_proj=False)
+        hidden = torch.randn(2, 1, 8, dtype=torch.bfloat16, requires_grad=True)
+        observed = []
+
+        def original(model, value):
+            observed.append((model.recompute_up_proj, value.device.type))
+            return value
+
+        monkeypatch.setattr(DSv4HybridSelfAttention._q_up_proj_and_norm, "__wrapped__", original)
+        assert q_up_proj_and_norm(attention, hidden) is hidden
+        assert observed == [(False, "cpu")]

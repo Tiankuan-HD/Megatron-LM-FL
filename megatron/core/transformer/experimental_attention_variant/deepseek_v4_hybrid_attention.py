@@ -24,6 +24,7 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_size, is_te_min_version
+from megatron.plugin.decorators import overridable
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -607,11 +608,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             """
             # q_compressed: [num_tokens, q_lora_rank]
             # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-            q, _ = self.linear_q_up_proj(q_compressed)
-
-            # q: [num_tokens, n, q_head_dim]
-            q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            q = self._q_up_proj_and_norm(q_compressed)
 
             kv, _ = self.linear_kv_proj(kv_compressed)
             kv = self.kv_layernorm(kv)
@@ -720,6 +717,13 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             )
 
         return query, key, value, q_compressed, kv_compressed
+
+    @overridable
+    def _q_up_proj_and_norm(self, q_compressed: torch.Tensor) -> torch.Tensor:
+        """Expand and normalize the compressed query before RoPE."""
+        q, _ = self.linear_q_up_proj(q_compressed)
+        q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
+        return _q_rms_norm(q, self.config.layernorm_epsilon)
 
     def backward_dw(self) -> NoReturn:
         """Execute weight gradient computation"""

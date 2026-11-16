@@ -366,6 +366,11 @@ register(
 
 # Ascend compressed sparse attention and indexer.
 register(
+    target="megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention.DSv4HybridSelfAttention._q_up_proj_and_norm",
+    impl="megatron.plugin.Ascend.transformer.experimental_attention_variant.dsv4_hybrid_attention.q_up_proj_and_norm",
+    vendor="npu",
+)
+register(
     target="megatron.core.transformer.experimental_attention_variant.csa.CompressedSparseAttention._forward_unfused_csa",
     impl="megatron.plugin.Ascend.transformer.experimental_attention_variant.csa.forward_unfused_csa",
     vendor="npu",
