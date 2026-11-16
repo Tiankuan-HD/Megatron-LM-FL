@@ -2602,6 +2602,8 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            num_layers=args.num_layers + (args.mtp_num_layers or 0),
+            csa_compress_ratios=getattr(args, 'csa_compress_ratios', None),
         )
 
     # Dump memory snapshot and print metrics to stdout.

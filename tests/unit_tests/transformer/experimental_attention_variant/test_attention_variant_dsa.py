@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -18,6 +18,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerLossAutoScaler,
+    DSAIndexerLossLoggingHelper,
     DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
@@ -29,7 +30,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, get_current_device
 
 try:
     from fast_hadamard_transform import hadamard_transform as _hadamard_transform
@@ -1762,3 +1763,82 @@ class TestDSAModuleSpecDispatch:
 
 
 pytestmark = pytest.mark.experimental
+
+
+class TestDSAIndexerLossLoggingHelper:
+    """Exercise real PP reductions when a pipeline stage has no indexer losses."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch):
+        if Utils.world_size < 2 or Utils.world_size % 2:
+            pytest.skip("Indexer logging regression requires an even world size of at least two")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=2
+        )
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, 'tracker', {})
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "ratios",
+        [[0, 0, 4, 128], [128, 128, 128, 4], [4, 128, 128, 4], [128, 128, 128, 128], None],
+        ids=["first-stage-only", "last-stage-only", "both-stages", "no-indexer", "legacy-dsa"],
+    )
+    @pytest.mark.parametrize("mtp_num_layers", [0, 1])
+    def test_metrics_across_pipeline_stages(self, ratios, mtp_num_layers):
+        """Check averaging and repeated logging/clearing with asymmetric PP ownership."""
+        num_layers = 4 + mtp_num_layers
+        if ratios is not None:
+            ratios = ratios + [4] * mtp_num_layers
+        indexer_layers = [
+            layer for layer in range(1, num_layers + 1) if ratios is None or ratios[layer - 1] == 4
+        ]
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        dp_rank = parallel_state.get_data_parallel_rank()
+        dp_mean = (parallel_state.get_data_parallel_world_size() - 1) / 2
+        writer, wandb_writer = Mock(), Mock()
+        storage = None
+
+        for iteration in (1, 2):
+            for layer in indexer_layers:
+                if (0 if layer <= 3 else 1) != pp_rank:
+                    continue
+                for microbatch in (1, 2):
+                    DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                        torch.tensor(
+                            iteration * (layer + microbatch + dp_rank),
+                            dtype=torch.float32,
+                            device=get_current_device(),
+                        ),
+                        layer_number=layer,
+                        num_layers=num_layers,
+                    )
+
+            total_loss_dict = {}
+            DSAIndexerLossLoggingHelper.track_indexer_metrics(
+                loss_scale=0.5,
+                iteration=iteration,
+                writer=writer,
+                wandb_writer=wandb_writer,
+                total_loss_dict=total_loss_dict,
+                num_layers=num_layers,
+                csa_compress_ratios=ratios,
+            )
+            expected = iteration * sum(layer + 1.5 + dp_mean for layer in indexer_layers)
+            expected /= max(len(indexer_layers), 1)
+            torch.testing.assert_close(total_loss_dict["indexer loss"].item(), expected)
+            writer.add_scalar.assert_called_once_with(
+                "indexer loss", total_loss_dict["indexer loss"], iteration
+            )
+            wandb_writer.log.assert_called_once_with(
+                {"indexer loss": total_loss_dict["indexer loss"]}, iteration
+            )
+            tracker = DSAIndexerLossLoggingHelper.tracker
+            assert tracker["values"].shape == (num_layers,)
+            assert torch.count_nonzero(tracker["values"]).item() == 0
+            assert tracker["reduce_group"] is None and tracker["avg_group"] is None
+            if storage is not None:
+                assert tracker["values"].data_ptr() == storage
+            storage = tracker["values"].data_ptr()
+            writer.reset_mock()
+            wandb_writer.reset_mock()

@@ -115,7 +115,7 @@ class DSAIndexerLossLoggingHelper:
         if "values" not in tracker:
             if num_layers is None:
                 return
-            tracker["values"] = torch.zeros(num_layers, device=cur_platform().current_device())
+            tracker["values"] = torch.zeros(num_layers, device=cur_platform.current_device())
         values = tracker["values"]
 
         torch.distributed.all_reduce(
