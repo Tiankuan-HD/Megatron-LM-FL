@@ -370,3 +370,9 @@ register(
     impl="megatron.plugin.Ascend.transformer.experimental_attention_variant.csa.forward_unfused_csa",
     vendor="npu",
 )
+
+register(
+    target="megatron.core.transformer.hyper_connection.HyperConnectionModule._projection_and_get_norm",
+    impl="megatron.plugin.Ascend.transformer.hyper_connection.projection_and_get_norm",
+    vendor="npu",
+)

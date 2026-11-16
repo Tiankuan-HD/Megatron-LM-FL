@@ -16,10 +16,12 @@ import torch
 
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutputManager,
+    checkpoint,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.plugin.platform import get_platform
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -408,3 +410,155 @@ class TestMHCBlockRecomputeIntegration:
 
         # Verify gradients match
         assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5)
+
+
+class TestAscendMHCMappingCheckpoint:
+    """Check Core arithmetic, nested full recompute and saved storage on NPU."""
+
+    @pytest.fixture(autouse=True)
+    def initialize_parallel(self):
+        if get_platform().device_name() != "npu":
+            pytest.skip("Ascend NPU required")
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    def _module(self, hidden_size=64):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            mhc_sinkhorn_iterations=5,
+        )
+        return HyperConnectionModule(config, layer_number=1).to("npu")
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("nested_full", [False, True])
+    @pytest.mark.parametrize("scale", [0.0, 1e-7, 1.0])
+    @pytest.mark.parametrize("hidden_size", [64, 4096])
+    def test_mapping_matches_core(self, dtype, nested_full, scale, hidden_size):
+        module = self._module(hidden_size)
+        x = torch.randn(16, 2, 4 * hidden_size, device="npu", dtype=dtype) * scale
+        original = HyperConnectionModule._projection_and_get_norm.__wrapped__
+        optimized = module._projection_and_get_norm
+        coefficients = [
+            torch.randn(16, 2, 4, device="npu"),
+            torch.randn(16, 2, 4, device="npu"),
+            torch.randn(16, 2, 4, 4, device="npu"),
+        ]
+
+        def run(projection):
+            module.zero_grad(set_to_none=True)
+            module._projection_and_get_norm = projection
+            hidden = x.detach().clone().requires_grad_(True)
+            outputs = (
+                checkpoint(module.compute_mappings, False, hidden)
+                if nested_full
+                else module.compute_mappings(hidden)
+            )
+            loss = sum((out.float() * coef).sum() for out, coef in zip(outputs, coefficients))
+            loss.backward()
+            return (
+                [out.detach().clone() for out in outputs],
+                [hidden.grad.clone()] + [p.grad.clone() for p in module.parameters()],
+            )
+
+        # Repeat after a parameter update so the recompute closure cannot use stale weights.
+        for _ in range(2):
+            reference = run(original.__get__(module, type(module)))
+            candidate = run(optimized)
+            for expected, actual in zip(reference, candidate):
+                for ref, opt in zip(expected, actual):
+                    torch.testing.assert_close(opt, ref, atol=1e-5, rtol=1e-5)
+            with torch.no_grad():
+                for parameter in module.parameters():
+                    parameter.add_(0.001)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_projection_does_not_save_fp32_input(self, dtype):
+        module = self._module()
+        x = torch.randn(16, 2, 256, device="npu", dtype=dtype, requires_grad=True)
+        original = HyperConnectionModule._projection_and_get_norm.__wrapped__
+
+        def saved_inputs(projection):
+            records = []
+
+            def pack(tensor):
+                records.append((tensor.dtype, tensor.numel(), tensor.untyped_storage().data_ptr()))
+                return tensor
+
+            with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+                outputs = projection(x)
+            del outputs
+            return records
+
+        reference = saved_inputs(original.__get__(module, type(module)))
+        candidate = saved_inputs(module._projection_and_get_norm)
+        assert any(dtype == torch.float32 and size == x.numel() for dtype, size, _ in reference)
+        assert not any(dtype == torch.float32 and size == x.numel() for dtype, size, _ in candidate)
+        assert any(pointer == x.untyped_storage().data_ptr() for _, _, pointer in candidate)
+
+    @pytest.mark.parametrize(
+        "device,dtype,grad_enabled",
+        [
+            ("cpu", torch.bfloat16, True),
+            ("npu", torch.float32, True),
+            ("npu", torch.bfloat16, False),
+        ],
+    )
+    def test_projection_fallback(self, device, dtype, grad_enabled):
+        module = self._module().to(device)
+        x = torch.randn(8, 2, 256, device=device, dtype=dtype, requires_grad=True)
+        original = HyperConnectionModule._projection_and_get_norm.__wrapped__
+        with torch.set_grad_enabled(grad_enabled):
+            reference = original(module, x)
+            candidate = module._projection_and_get_norm(x)
+        for ref, opt in zip(reference, candidate):
+            torch.testing.assert_close(opt, ref, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("nested_full", [False, True])
+    @pytest.mark.parametrize("local_checkpoint", [False, True])
+    def test_native_dispatch_and_recompute_count(self, nested_full, local_checkpoint, monkeypatch):
+        from megatron.plugin.Ascend.transformer import hyper_connection as ascend_mhc
+
+        module = self._module()
+        assert not module.config.use_fused_mhc
+        assert module._proj_rms_compute_h_op is None
+        hidden = torch.randn(16, 2, 256, device="npu", dtype=torch.bfloat16, requires_grad=True)
+        projection_grad_modes = []
+        checkpoint_inputs = []
+        native_projection = module._proj_rms_op
+        pytorch_checkpoint = ascend_mhc.checkpoint
+
+        def record_projection(*args):
+            projection_grad_modes.append(torch.is_grad_enabled())
+            return native_projection(*args)
+
+        def record_checkpoint(function, owner, x, **kwargs):
+            checkpoint_inputs.append((x.device.type, x.dtype, torch.is_grad_enabled()))
+            return pytorch_checkpoint(function, owner, x, **kwargs)
+
+        monkeypatch.setattr(module, "_proj_rms_op", record_projection)
+        monkeypatch.setattr(ascend_mhc, "checkpoint", record_checkpoint)
+        if not local_checkpoint:
+            original = HyperConnectionModule._projection_and_get_norm.__wrapped__
+            monkeypatch.setattr(
+                module, "_projection_and_get_norm", original.__get__(module, type(module))
+            )
+        outputs = (
+            checkpoint(module.compute_mappings, False, hidden)
+            if nested_full
+            else module.compute_mappings(hidden)
+        )
+        sum(out.float().square().sum() for out in outputs).backward()
+
+        expected_modes = ([False] if nested_full else []) + [True]
+        if local_checkpoint:
+            expected_modes.append(True)
+        assert projection_grad_modes == expected_modes
+        assert checkpoint_inputs == ([("npu", torch.bfloat16, True)] if local_checkpoint else [])
+        assert torch.isfinite(hidden.grad).all()

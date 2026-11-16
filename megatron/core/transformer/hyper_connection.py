@@ -13,6 +13,7 @@ from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
+from megatron.plugin.decorators import overridable
 
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
@@ -294,6 +295,7 @@ class HyperConnectionModule(MegatronModule):
             setattr(self.alpha_res, 'sequence_parallel', True)
             setattr(self.bias, 'sequence_parallel', True)
 
+    @overridable
     def _projection_and_get_norm(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Projection + RMS normalization.
