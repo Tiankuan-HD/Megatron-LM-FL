@@ -162,6 +162,25 @@ class _LayerwiseAllGatherHandle:
         self.handles = None
 
 
+class _MultiCoalescingHandle:
+    """Wraps one _coalescing_manager handle per param dtype.
+
+    不沿用 _LayerwiseAllGatherHandle「只等最后一个」的做法——
+    那依赖「同一 communicator 上按序完成」，那是 NCCL 的保证；这里跑 FlagCX/HCCL，
+    逐个 wait 的代价可以忽略，不赌这个前提。
+    """
+
+    def __init__(self, handles):
+        self.handles = handles
+
+    def wait(self):
+        """Wait on every handle."""
+        for handle in self.handles or ():
+            if handle is not None:
+                handle.wait()
+        self.handles = None
+
+
 class _ParamAndGradBucketGroup:
     """
     Put multiple buckets into a group so that their communications can be aggregated together.
@@ -472,25 +491,42 @@ class _ParamAndGradBucketGroup:
             # Standard distributed optimizer path: use _coalescing_manager.
             # all_gather_into_tensor writes directly into a contiguous output buffer and
             # does not need a copy-back step, so coalescing works correctly.
-            with _coalescing_manager(
-                self.intra_distributed_optimizer_instance_group, async_ops=async_op
-            ) as cm:
-                for idx, bucket in enumerate(self.buckets):
-                    if self.cached_param_buffer_shard_list[idx] is None:
-                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                            bucket.param_data, self.intra_distributed_optimizer_instance_size
+            # 一个 bucket group 可以跨多个 buffer，而 buffer 是按
+            # (param_dtype, grad_dtype) 分的，所以组内 bucket 的 param_data 可能混 dtype。
+            # 实测 DSV4-Flash L4 双机 32 rank 上有一组是 bf16(152316032) + fp32(792192)。
+            # allgather_into_tensor_coalesced 要求整批 dtype 一致，混了就抛
+            # "TypeError: Tensors must have identical type"。
+            # 这里按 dtype 分批，每批一个 coalescing manager：通信语义不变，只是把一次批量
+            # 拆成按 dtype 的几次。分组用「首次出现顺序」，而 self.buckets 在各 rank 上顺序
+            # 一致，所以各 rank 发起集合通信的顺序仍然一致。
+            buckets_by_dtype = {}
+            for idx, bucket in enumerate(self.buckets):
+                buckets_by_dtype.setdefault(bucket.param_data.dtype, []).append(idx)
+
+            coalescing_handles = []
+            for dtype_bucket_indices in buckets_by_dtype.values():
+                with _coalescing_manager(
+                    self.intra_distributed_optimizer_instance_group, async_ops=async_op
+                ) as cm:
+                    for idx in dtype_bucket_indices:
+                        bucket = self.buckets[idx]
+                        if self.cached_param_buffer_shard_list[idx] is None:
+                            self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                                bucket.param_data,
+                                self.intra_distributed_optimizer_instance_size,
+                            )
+                        local_data_view = self.cached_param_buffer_shard_list[idx][
+                            self.intra_distributed_optimizer_instance_rank
+                        ]
+                        dist_all_gather_func(
+                            bucket.param_data,
+                            local_data_view,
+                            group=self.intra_distributed_optimizer_instance_group,
+                            async_op=async_op,
                         )
-                    local_data_view = self.cached_param_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
-                    dist_all_gather_func(
-                        bucket.param_data,
-                        local_data_view,
-                        group=self.intra_distributed_optimizer_instance_group,
-                        async_op=async_op,
-                    )
+                coalescing_handles.append(cm)
             if async_op:
-                self.param_gather_handle = cm
+                self.param_gather_handle = _MultiCoalescingHandle(coalescing_handles)
             else:
                 # When using `_coalescing_manager`, even if a synchronous op
                 # (async_op=False) is used, `cm` is not None. Manually set to None for
