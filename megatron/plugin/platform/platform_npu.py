@@ -414,10 +414,50 @@ def dummy_compile(*args, **kwargs):
     return compile_wrapper
 
 
+_TE_FL_VERSION_CACHE = None
+
+
+def _te_fl_source_version():
+    """报 TE-FL 源码树自报的版本，而不是写死一个数。
+
+    TE-FL 从源码走 PYTHONPATH、没有 dist-info，
+    `metadata.version` 查不到，所以这里要代答。原来写死 '2.2.0'，会把所有
+    `is_te_min_version('>=2.14')` 的特性门误判为不满足（moe_single_grouped_weight 即是），
+    而源码 build_tools/VERSION.txt 实际是 2.17.0。
+    这里按 sys.path 找出真正被 import 的那棵 TE-FL 源码树并读它的 VERSION.txt；
+    找不到才回退 '2.2.0'，保持改动前的行为。
+    """
+    global _TE_FL_VERSION_CACHE
+    if _TE_FL_VERSION_CACHE is not None:
+        return _TE_FL_VERSION_CACHE
+    version = '2.2.0'
+    for entry in sys.path:
+        if not entry:
+            continue
+        version_file = os.path.join(entry, 'build_tools', 'VERSION.txt')
+        if os.path.isdir(os.path.join(entry, 'transformer_engine')) and os.path.isfile(version_file):
+            try:
+                with open(version_file) as handle:
+                    text = handle.read().strip()
+            except OSError:
+                break
+            if text:
+                version = text
+            break
+    _TE_FL_VERSION_CACHE = version
+    return version
+
+
 def version_wrapper(fn):
     @wraps(fn)
     def wrapper(name, *args, **kwargs):
-        return '2.2.0' if name == 'transformer-engine' else fn(name, *args, **kwargs)
+        # TE-FL ea6c2fac 的 __init__.py:164 用下划线拼写 metadata.version('transformer_engine')，
+        # 原补丁只认连字符，穿透后抛 PackageNotFoundError（ImportError 子类），被上层
+        # except ImportError 静默吞掉，表现为 TENorm 未定义 / get_te_version()==0.0.0。
+        # 两种拼写都认。
+        if name in ('transformer-engine', 'transformer_engine'):
+            return _te_fl_source_version()
+        return fn(name, *args, **kwargs)
 
     return wrapper
 
