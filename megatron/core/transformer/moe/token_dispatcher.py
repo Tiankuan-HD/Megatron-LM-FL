@@ -879,6 +879,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.post_forward_comm()
         return permutated_local_input_tokens
 
+    @overridable
     def combine_postprocess(self, permutated_local_input_tokens):
         """Finalizes token reconstruction with un-permutation and reshaping.
 

@@ -83,6 +83,7 @@ def preprocess(self, hidden_states, probs, routing_map):
 
 def dispatch_preprocess(self, hidden_states, routing_map, probs):
     """Write the first token permutation directly in native MC2 round order."""
+    self._npu_moe_permutation_pair = None
     self._npu_moe_expert_order = None
     if not getattr(self, "_npu_moe_schedule", False):
         return MoEAlltoAllTokenDispatcher.dispatch_preprocess.__wrapped__(
@@ -103,7 +104,8 @@ def dispatch_preprocess(self, hidden_states, routing_map, probs):
     ordered_probs = probs
     self.routing_map = routing_map
     self.tokens_per_expert = tokens_per_expert
-    if supports_moe_counts(counts):
+    counts_supported = supports_moe_counts(counts)
+    if counts_supported:
         orders = (
             counts.sum(0)
             .reshape(self.ep_size, self.num_local_experts)
@@ -124,15 +126,51 @@ def dispatch_preprocess(self, hidden_states, routing_map, probs):
     self.probs = probs
     if self.shared_experts is not None:
         self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
-    output, permuted_probs, mapping, _, _ = permute(
-        hidden_states,
-        self.routing_map,
-        probs=ordered_probs,
-        num_out_tokens=self.num_out_tokens,
-        fused=self.config.moe_permute_fusion,
-    )
+    if counts_supported and self.config.moe_permute_fusion:
+        from transformer_engine.plugin import tefl
+
+        get_pair = getattr(tefl, "get_moe_permutation_pair", None)
+        if get_pair is not None:
+            self._npu_moe_permutation_pair = get_pair(
+                hidden_states,
+                self.routing_map,
+                ordered_probs,
+                self.num_out_tokens,
+                self.config.moe_router_topk,
+            )
+    if self._npu_moe_permutation_pair is None:
+        output, permuted_probs, mapping, _, _ = permute(
+            hidden_states,
+            self.routing_map,
+            probs=ordered_probs,
+            num_out_tokens=self.num_out_tokens,
+            fused=self.config.moe_permute_fusion,
+        )
+    else:
+        self.routing_map = self.routing_map.contiguous()
+        output, permuted_probs, mapping = self._npu_moe_permutation_pair[0](
+            hidden_states, self.routing_map, ordered_probs, self.num_out_tokens
+        )
     self.reversed_local_input_permutation_mapping = mapping
     return output, permuted_probs
+
+
+def combine_postprocess(self, permutated_local_input_tokens: torch.Tensor) -> torch.Tensor:
+    """Consume the permutation pair selected by this dispatch, then restore the layer shape."""
+    pair = getattr(self, "_npu_moe_permutation_pair", None)
+    if pair is None:
+        return MoEAlltoAllTokenDispatcher.combine_postprocess.__wrapped__(
+            self, permutated_local_input_tokens
+        )
+    output = pair[1](
+        permutated_local_input_tokens,
+        self.reversed_local_input_permutation_mapping,
+        self.hidden_shape_before_permute,
+        self.routing_map,
+    ).view(self.hidden_shape)
+    if self.shared_experts is not None:
+        output += self.shared_experts.get_output()
+    return output
 
 
 def gather_tokens_per_expert(self, counts):

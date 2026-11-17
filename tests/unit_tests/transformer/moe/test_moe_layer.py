@@ -404,16 +404,19 @@ class TestMoELayerRecompute:
 
 
 @pytest.mark.parametrize(
-    "tp_size, etp_size, ep_size, deny_fusion, routing_case",
+    "tp_size, etp_size, ep_size, deny_fusion, routing_case, permutation_case",
     [
-        (1, 1, 8, False, "random"),
-        (4, 1, 8, False, "random"),
-        (4, 2, 8, False, "random"),
-        (4, 1, 8, True, "random"),
-        (4, 1, 8, False, "local_disabled"),
-        (1, 1, 2, False, "random"),
-        (4, 1, 8, False, "skewed"),
-        (1, 1, 8, False, "overflow"),
+        (1, 1, 8, False, "random", "native"),
+        (4, 1, 8, False, "random", "native"),
+        (4, 2, 8, False, "random", "native"),
+        (4, 1, 8, True, "random", "native"),
+        (4, 1, 8, False, "local_disabled", "native"),
+        (1, 1, 2, False, "random", "native"),
+        (4, 1, 8, False, "skewed", "native"),
+        (1, 1, 8, False, "overflow", "native"),
+        (4, 1, 8, False, "random", "policy_denied"),
+        (4, 1, 8, False, "random", "missing_symbol"),
+        (4, 1, 8, False, "random", "unfused_permutation"),
     ],
 )
 @pytest.mark.parametrize("dense_weight", [False, True])
@@ -428,8 +431,9 @@ def test_npu_mc2_layer_matches_unfused(
     dense_weight,
     recompute,
     clamp_value=None,
+    permutation_case="native",
 ):
-    """Compare complete expert/input/router gradients and the disabled path on NPU."""
+    """Compare all gradients with unfused experts and with the existing dense MC2 path."""
     import copy
     import os
     from dataclasses import replace
@@ -442,6 +446,7 @@ def test_npu_mc2_layer_matches_unfused(
     if get_platform().device_name() != "npu" or Utils.world_size < ep_size * etp_size:
         pytest.skip(f"MC2 layer comparison requires at least {ep_size * etp_size} Ascend ranks")
     import flagcx  # noqa: F401; register the optional test backend before group initialization
+    import torch_npu
     from transformer_engine.plugin import tefl
     from transformer_engine.plugin.core.policy import policy_context, policy_from_env
 
@@ -469,7 +474,7 @@ def test_npu_mc2_layer_matches_unfused(
             moe_ffn_hidden_size=64 if overflow else 512,
             moe_router_topk=2 if overflow else 8,
             moe_grouped_gemm=True,
-            moe_permute_fusion=True,
+            moe_permute_fusion=permutation_case != "unfused_permutation",
             moe_single_grouped_weight=dense_weight,
             moe_token_dispatcher_type="alltoall",
             moe_router_dtype="fp32",
@@ -549,6 +554,30 @@ def test_npu_mc2_layer_matches_unfused(
                     ("moe_grouped_matmul_alltoallv", ("reference",)),
                 ),
             )
+        if permutation_case == "policy_denied":
+            policy = replace(
+                policy,
+                per_op_order=policy.per_op_order
+                + (
+                    ("moe_permute_with_routing_map", ("reference",)),
+                    ("moe_unpermute_with_routing_map", ("reference",)),
+                ),
+            )
+        native_calls = []
+        for name in (
+            "npu_moe_token_permute_with_routing_map",
+            "npu_moe_token_unpermute_with_routing_map",
+        ):
+            native_op = getattr(torch_npu, name)
+
+            def trace_native(*args, _op=native_op, _name=name, **kwargs):
+                result = _op(*args, **kwargs)
+                native_calls.append(_name)
+                return result
+
+            monkeypatch.setattr(torch_npu, name, trace_native)
+        if permutation_case == "missing_symbol":
+            monkeypatch.delattr(torch_npu, "npu_moe_token_unpermute_with_routing_map")
         with policy_context(policy):
             assert tefl.is_moe_fusion_available() == (
                 not deny_fusion or candidate.token_dispatcher.ep_rank != 0
@@ -596,7 +625,21 @@ def test_npu_mc2_layer_matches_unfused(
             return output.detach(), inp.grad.detach(), grads
 
         actual, expected = run(candidate), run(reference)
-        assert len(metadata_calls) == (4 if recompute else 2)
+        forwards = 4 if recompute else 2
+        assert len(metadata_calls) == forwards
+        expect_native = expect_fused and permutation_case == "native"
+        assert bool(candidate.token_dispatcher._npu_moe_permutation_pair) == expect_native
+        mapping = candidate.token_dispatcher.reversed_local_input_permutation_mapping
+        if expect_native:
+            assert mapping.ndim == 1 and mapping.dtype == torch.int32
+            assert mapping.numel() == tokens * config.moe_router_topk
+            assert mapping.untyped_storage().nbytes() == mapping.numel() * mapping.element_size()
+            assert native_calls.count("npu_moe_token_permute_with_routing_map") == forwards
+            assert native_calls.count("npu_moe_token_unpermute_with_routing_map") == forwards
+            order = candidate.token_dispatcher._npu_moe_expert_order[0]
+            assert order != list(range(len(order)))
+        else:
+            assert native_calls == []
         if overflow:
             assert candidate.token_dispatcher._npu_moe_expert_order is None
         if routing_case in ("skewed", "overflow"):
@@ -626,10 +669,22 @@ def test_npu_mc2_layer_matches_unfused(
                     torch.testing.assert_close(value, baseline, rtol=0, atol=0, msg=name)
 
         compare(actual, expected, expect_fused)
+        if expect_native:
+            native_calls.clear()
+            with monkeypatch.context() as dense_pair:
+                dense_pair.setattr(tefl, "get_moe_permutation_pair", lambda *args: None)
+                dense_mc2 = run(candidate)
+            assert native_calls == []
+            assert candidate.token_dispatcher._npu_moe_permutation_pair is None
+            assert candidate._npu_moe_mc2_logged
+            compare(actual, dense_mc2, True)
+        native_calls.clear()
         with monkeypatch.context() as disabled_env:
             disabled_env.setenv("NPU_MOE_MC2", "0")
             disabled, plain = run(candidate), run(reference)
         compare(disabled, plain, False)
+        assert candidate.token_dispatcher._npu_moe_permutation_pair is None
+        assert native_calls == []
         with monkeypatch.context() as denied_env:
             denied_env.setenv("TE_FL_DENY_VENDORS", "NPU")
             with policy_context(policy_from_env()):
@@ -637,6 +692,80 @@ def test_npu_mc2_layer_matches_unfused(
                 assert not tefl.is_moe_fusion_available(candidate.token_dispatcher.ep_group, device)
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_npu_mc2_pair_state_and_shared_output_cpu(monkeypatch):
+    """Keep a selected inverse for combine, then reset it before a dense fallback dispatch."""
+    from types import SimpleNamespace
+
+    from transformer_engine.plugin import tefl
+
+    from megatron.plugin.Ascend.transformer.moe import fused_experts
+
+    torch.manual_seed(19)
+    shape = (3, 2, 4)
+    routing_map = torch.tensor([[1, 0, 1, 0], [0, 1, 1, 0], [1, 0, 0, 1]] * 2, dtype=torch.bool)
+    token_rows = routing_map.T.nonzero()[:, 1]
+    native_mapping = token_rows.argsort(stable=True).to(torch.int32)
+    shared = torch.randn(shape, dtype=torch.float64, requires_grad=True)
+    pre_forward_shapes = []
+    inverses = []
+
+    def fixed_inverse(tokens, mapping, restore_shape, route):
+        assert mapping is native_mapping and route is routing_map
+        inverses.append(1)
+        return tokens.index_select(0, mapping.long()).reshape(*restore_shape[:1], 2, -1).sum(1)
+
+    def unexpected_resolve(*args):
+        raise AssertionError("combine must retain the pair selected during dispatch")
+
+    monkeypatch.setattr(tefl, "get_moe_permutation_pair", unexpected_resolve)
+    dispatcher = SimpleNamespace(
+        _npu_moe_schedule=False,
+        _npu_moe_permutation_pair=(None, fixed_inverse),
+        hidden_shape=shape,
+        hidden_shape_before_permute=(6, 4),
+        reversed_local_input_permutation_mapping=native_mapping,
+        routing_map=routing_map,
+        config=SimpleNamespace(moe_permute_fusion=False, moe_router_padding_for_quantization=False),
+        drop_and_pad=False,
+        num_out_tokens=12,
+        preprocess=lambda route: route.sum(0),
+        _maybe_dtoh_and_synchronize=lambda point, counts: counts,
+        shared_experts=SimpleNamespace(
+            pre_forward_comm=lambda x: pre_forward_shapes.append(x.shape), get_output=lambda: shared
+        ),
+    )
+    inputs = [torch.randn(shape, dtype=torch.float64, requires_grad=True) for _ in range(2)]
+    probs = [torch.randn(6, 4, dtype=torch.float64, requires_grad=True) for _ in range(2)]
+    weighted = inputs[0].view(6, 4).index_select(0, token_rows) * probs[0].T[routing_map.T][:, None]
+    native_output = fused_experts.combine_postprocess(dispatcher, weighted)
+    assert inverses == [1]
+
+    dense_tokens, dense_probs = fused_experts.dispatch_preprocess(
+        dispatcher, inputs[1], routing_map, probs[1]
+    )
+    assert dispatcher._npu_moe_permutation_pair is None
+    assert dispatcher._npu_moe_expert_order is None
+    dense_output = fused_experts.combine_postprocess(
+        dispatcher, dense_tokens * dense_probs[:, None]
+    )
+    assert inverses == [1]
+    assert pre_forward_shapes == [shape]
+    expected = [
+        (x.view(6, 4) * (p * routing_map).sum(1, keepdim=True)).view(shape) + shared
+        for x, p in zip(inputs, probs)
+    ]
+    upstream = [torch.randn_like(value) for value in expected]
+    variables = (*inputs, *probs, shared)
+    actual_grads = torch.autograd.grad(
+        (native_output, dense_output), variables, upstream, retain_graph=True
+    )
+    expected_grads = torch.autograd.grad(expected, variables, upstream)
+    for actual, reference in zip((native_output, dense_output), expected):
+        torch.testing.assert_close(actual, reference, rtol=1e-12, atol=1e-12)
+    for actual, reference in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual, reference, rtol=1e-12, atol=1e-12)
 
 
 @pytest.mark.parametrize("count, supported", [(0, True), (65535, True), (65536, False)])
