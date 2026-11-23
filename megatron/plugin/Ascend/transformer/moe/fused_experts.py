@@ -104,7 +104,11 @@ def dispatch_preprocess(self, hidden_states, routing_map, probs):
     ordered_probs = probs
     self.routing_map = routing_map
     self.tokens_per_expert = tokens_per_expert
-    counts_supported = supports_moe_counts(counts)
+    from transformer_engine.plugin.core.backends.vendor.npu import mc2
+
+    counts_supported = mc2.supports_moe_counts(
+        counts, hidden_states.size(-1), hidden_states.element_size()
+    )
     if counts_supported:
         orders = (
             counts.sum(0)
@@ -127,17 +131,10 @@ def dispatch_preprocess(self, hidden_states, routing_map, probs):
     if self.shared_experts is not None:
         self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
     if counts_supported and self.config.moe_permute_fusion:
-        from transformer_engine.plugin import tefl
-
-        get_pair = getattr(tefl, "get_moe_permutation_pair", None)
-        if get_pair is not None:
-            self._npu_moe_permutation_pair = get_pair(
-                hidden_states,
-                self.routing_map,
-                ordered_probs,
-                self.num_out_tokens,
-                self.config.moe_router_topk,
-            )
+        self._npu_moe_permutation_pair = mc2.get_moe_permutation_pair(
+            hidden_states, self.routing_map, ordered_probs, self.num_out_tokens,
+            self.config.moe_router_topk,
+        )
     if self._npu_moe_permutation_pair is None:
         output, permuted_probs, mapping, _, _ = permute(
             hidden_states,
@@ -198,33 +195,31 @@ def _supports_group(layer, x):
     if cached is None or cached[0] != key:
         supported = _supported(layer, x)
         if supported:
-            from transformer_engine.plugin import tefl
+            from transformer_engine.plugin.core.backends.vendor import npu
 
+            mc2 = getattr(npu, "mc2", None)
             # This local probe must not initialize a communicator.
-            supported = tefl.is_moe_fusion_available()
+            supported = mc2 is not None and mc2.is_moe_fusion_available()
         flag = torch.tensor(int(supported), dtype=torch.int64, device=device)
         dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=dispatcher.ep_group)
         if flag.item():
             # Communicator lookup may be collective: enter only after all ranks agree.
-            flag.fill_(int(tefl.is_moe_fusion_available(dispatcher.ep_group, device)))
+            flag.fill_(int(mc2.is_moe_fusion_available(dispatcher.ep_group, device)))
             dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=dispatcher.ep_group)
         cached = (key, bool(flag.item()))
         dispatcher._npu_moe_group_support = cached
     return cached[1] and _supported(layer, x)
 
 
-def supports_moe_counts(counts):
-    """Check the complete host count matrix shared by all EP ranks."""
-    # CANN 9.0.1 GroupedMatMulAlltoAllv stores per-source/expert counts in uint16_t.
-    # This operator runs in FC2 forward and FC1 input backward.
-    return counts.max().item() < 65536
-
-
 def _weights(linear, order=None):
-    # MC2 bypasses Linear.forward: invoke only its still-registered native DDP hook.
-    # disable_forward_pre_hook removes this id; re-enabling installs the new one.
-    hook = linear._forward_pre_hooks.get(getattr(linear, "_npu_mc2_param_sync_hook_id", None))
-    if hook is not None:
+    # DDP removes these handles when overlap is disabled and replaces them on enable.
+    owner = getattr(linear, "_npu_mc2_ddp", None)
+    ddp = owner() if owner is not None else None
+    if ddp is not None and ddp.remove_forward_pre_hook_handles:
+        handle = ddp.remove_forward_pre_hook_handles.get(linear)
+        hook = linear._forward_pre_hooks.get(handle.id) if handle is not None else None
+        if hook is None:
+            raise RuntimeError("MC2 cannot read expert weights: active DDP parameter sync hook is missing")
         hook(linear)
     if getattr(linear, "_mg_dense_grouped_weight", False):
         return linear.weight if order is None else linear.weight.index_select(0, order[1])
@@ -244,11 +239,11 @@ def compute_experts(self, hidden_states, probs):
     for point in ("before_ep_alltoall", "before_permutation_2", "before_finish"):
         tokens_per_expert = dispatcher._maybe_dtoh_and_synchronize(point, tokens_per_expert)
     dispatcher.tokens_per_expert = tokens_per_expert
-    # Every EP rank sees the full current matrix, including remote-only overflows.
-    if not supports_moe_counts(counts):
+    # Only a supported count matrix receives an expert order during dispatch.
+    if dispatcher._npu_moe_expert_order is None:
         if getattr(self, "_npu_moe_mc2_logged", None) is not False:
             logging.getLogger(__name__).warning(
-                "NPU_MOE_MC2 fallback: per-source/expert count=%s exceeds uint16 limit; layer=%s",
+                "NPU_MOE_MC2 fallback: unsupported collective size (max expert count=%s); layer=%s",
                 counts.max().item(),
                 self.layer_number,
             )
