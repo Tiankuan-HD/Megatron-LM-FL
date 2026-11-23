@@ -413,6 +413,8 @@ class TestMoELayerRecompute:
         (4, 1, 8, False, "local_disabled", "native"),
         (1, 1, 2, False, "random", "native"),
         (4, 1, 8, False, "skewed", "native"),
+        (1, 1, 8, False, "small_payload", "native"),
+        (1, 1, 8, False, "empty_destination", "native"),
         (1, 1, 8, False, "overflow", "native"),
         (4, 1, 8, False, "random", "policy_denied"),
         (4, 1, 8, False, "random", "missing_symbol"),
@@ -447,10 +449,10 @@ def test_npu_mc2_layer_matches_unfused(
         pytest.skip(f"MC2 layer comparison requires at least {ep_size * etp_size} Ascend ranks")
     import flagcx  # noqa: F401; register the optional test backend before group initialization
     import torch_npu
-    from transformer_engine.plugin import tefl
+    from transformer_engine.plugin.core.backends.vendor.npu import mc2
     from transformer_engine.plugin.core.policy import policy_context, policy_from_env
 
-    if not tefl.is_moe_fusion_available():
+    if not mc2.is_moe_fusion_available():
         pytest.skip("Native MC2 interfaces are unavailable under the current policy")
     monkeypatch.setenv("NPU_MOE_MC2", "1")
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", str(int(dense_weight)))
@@ -510,12 +512,17 @@ def test_npu_mc2_layer_matches_unfused(
                 for name, param in candidate.named_parameters():
                     if "linear_fc1.weight" in name:
                         param.mul_(100)
-        if routing_case in ("skewed", "overflow"):
+        if routing_case in ("skewed", "overflow", "empty_destination"):
             with torch.no_grad():
                 weight = candidate.router.weight
                 weight.zero_()
                 weight[:, 0] = torch.linspace(-0.2, 0.2, num_experts, device=device)
                 hot = torch.arange(config.moe_router_topk, device=device) * 32 + 5
+                # Exercise skew with one active expert per destination for either input sign.
+                if routing_case == "empty_destination":
+                    hot = torch.arange(config.moe_router_topk) + 8
+                cold = hot + (8 if routing_case == "empty_destination" else 1)
+                weight[cold, 0] = -1
                 weight[hot, 0] = (
                     0.8 + torch.arange(config.moe_router_topk, device=device) * 0.02
                 ).to(weight.dtype)
@@ -524,8 +531,10 @@ def test_npu_mc2_layer_matches_unfused(
         reference.preprocess = MethodType(MoELayer.preprocess.__wrapped__, reference)
         torch.manual_seed(37 + int(os.environ["RANK"]))
         tokens = 65536 if overflow and candidate.token_dispatcher.ep_rank == 7 else 256
+        if routing_case == "small_payload":
+            tokens = 32
         x = torch.randn(tokens, 1, hidden_size, device=device, dtype=torch.bfloat16) / 4
-        if routing_case in ("skewed", "overflow"):
+        if routing_case in ("skewed", "overflow", "empty_destination"):
             x[:, :, 0] = 1
 
             def check_skewed_routing(module, inputs, result):
@@ -579,7 +588,7 @@ def test_npu_mc2_layer_matches_unfused(
         if permutation_case == "missing_symbol":
             monkeypatch.delattr(torch_npu, "npu_moe_token_unpermute_with_routing_map")
         with policy_context(policy):
-            assert tefl.is_moe_fusion_available() == (
+            assert mc2.is_moe_fusion_available() == (
                 not deny_fusion or candidate.token_dispatcher.ep_rank != 0
             )
         if routing_case == "local_disabled" and candidate.token_dispatcher.ep_rank == 0:
@@ -588,7 +597,7 @@ def test_npu_mc2_layer_matches_unfused(
             etp_size == 1
             and ep_size == 8
             and not deny_fusion
-            and routing_case not in ("overflow", "local_disabled")
+            and routing_case not in ("overflow", "local_disabled", "small_payload", "empty_destination")
         )
 
         def run(module):
@@ -642,7 +651,7 @@ def test_npu_mc2_layer_matches_unfused(
             assert native_calls == []
         if overflow:
             assert candidate.token_dispatcher._npu_moe_expert_order is None
-        if routing_case in ("skewed", "overflow"):
+        if routing_case in ("skewed", "overflow", "empty_destination"):
             assert actual[2]["router.weight"].norm().item() > 0
         assert bool(getattr(candidate, "_npu_moe_mc2_logged", False)) == expect_fused
         if ep_size == 2:
@@ -672,7 +681,7 @@ def test_npu_mc2_layer_matches_unfused(
         if expect_native:
             native_calls.clear()
             with monkeypatch.context() as dense_pair:
-                dense_pair.setattr(tefl, "get_moe_permutation_pair", lambda *args: None)
+                dense_pair.setattr(mc2, "get_moe_permutation_pair", lambda *args: None)
                 dense_mc2 = run(candidate)
             assert native_calls == []
             assert candidate.token_dispatcher._npu_moe_permutation_pair is None
@@ -688,8 +697,8 @@ def test_npu_mc2_layer_matches_unfused(
         with monkeypatch.context() as denied_env:
             denied_env.setenv("TE_FL_DENY_VENDORS", "NPU")
             with policy_context(policy_from_env()):
-                assert not tefl.is_moe_fusion_available()
-                assert not tefl.is_moe_fusion_available(candidate.token_dispatcher.ep_group, device)
+                assert not mc2.is_moe_fusion_available()
+                assert not mc2.is_moe_fusion_available(candidate.token_dispatcher.ep_group, device)
     finally:
         Utils.destroy_model_parallel()
 
@@ -698,7 +707,7 @@ def test_npu_mc2_pair_state_and_shared_output_cpu(monkeypatch):
     """Keep a selected inverse for combine, then reset it before a dense fallback dispatch."""
     from types import SimpleNamespace
 
-    from transformer_engine.plugin import tefl
+    from transformer_engine.plugin.core.backends.vendor.npu import mc2
 
     from megatron.plugin.Ascend.transformer.moe import fused_experts
 
@@ -719,7 +728,7 @@ def test_npu_mc2_pair_state_and_shared_output_cpu(monkeypatch):
     def unexpected_resolve(*args):
         raise AssertionError("combine must retain the pair selected during dispatch")
 
-    monkeypatch.setattr(tefl, "get_moe_permutation_pair", unexpected_resolve)
+    monkeypatch.setattr(mc2, "get_moe_permutation_pair", unexpected_resolve)
     dispatcher = SimpleNamespace(
         _npu_moe_schedule=False,
         _npu_moe_permutation_pair=(None, fixed_inverse),
@@ -768,14 +777,31 @@ def test_npu_mc2_pair_state_and_shared_output_cpu(monkeypatch):
         torch.testing.assert_close(actual, reference, rtol=1e-12, atol=1e-12)
 
 
-@pytest.mark.parametrize("count, supported", [(0, True), (65535, True), (65536, False)])
-def test_npu_mc2_global_count_limit(count, supported):
-    """A remote expert's overflow must disable fusion on every EP rank."""
-    from megatron.plugin.Ascend.transformer.moe.fused_experts import supports_moe_counts
+@pytest.mark.parametrize(
+    "case, supported",
+    [("threshold", True), ("small_send", False), ("small_receive", False),
+     ("empty_rank", False), ("empty_expert", True), ("count_limit", True), ("overflow", False)],
+)
+def test_npu_mc2_global_count_limit(case, supported):
+    from transformer_engine.plugin.core.backends.vendor.npu.mc2 import supports_moe_counts
 
-    counts = torch.zeros(8, 256, dtype=torch.int64)
-    counts[-1, -1] = count
-    assert supports_moe_counts(counts) is supported
+    # 512 BF16 rows of width 2048 are exactly 2 MiB per source/destination.
+    counts = torch.full((8, 16), 32, dtype=torch.int64)
+    if case == "small_send":
+        counts[-1, 0] -= 1
+        counts[0, 0] += 1
+    elif case == "small_receive":
+        counts[0, -1] -= 1
+        counts[0, 0] += 1
+    elif case == "empty_rank":
+        counts[:, :2] += counts[:, -2:]
+        counts[:, -2:] = 0
+    elif case == "empty_expert":
+        counts[:, 0] += counts[:, 1]
+        counts[:, 1] = 0
+    elif case in ("count_limit", "overflow"):
+        counts[-1, -1] = 65535 if case == "count_limit" else 65536
+    assert supports_moe_counts(counts, 2048, 2) is supported
 
 
 @pytest.mark.parametrize("dense_weight", [False, True])
@@ -852,6 +878,13 @@ def test_npu_mc2_ddp_weight_readiness(monkeypatch, dense_weight):
                 if enabled:
                     for param in linear.parameters():
                         assert ddp.param_to_bucket_group[param].param_gather_handle is None
+            if enabled:
+                linear = linears[0]
+                handle = ddp.remove_forward_pre_hook_handles[linear]
+                with monkeypatch.context() as broken:
+                    broken.delitem(linear._forward_pre_hooks, handle.id)
+                    with pytest.raises(RuntimeError, match="active DDP parameter sync hook is missing"):
+                        _weights(linear)
             if enabled:
                 ddp.disable_forward_pre_hook(param_sync=False)
             else:

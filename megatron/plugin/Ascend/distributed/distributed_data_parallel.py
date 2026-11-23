@@ -2,6 +2,7 @@
 # See LICENSE for license information.
 
 import os
+import weakref
 
 from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
 from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -15,6 +16,4 @@ def enable_forward_pre_hook(self: DistributedDataParallel) -> None:
         for module in self.module.modules():
             if isinstance(module, MoELayer) and isinstance(module.experts, TEGroupedMLP):
                 for linear in (module.experts.linear_fc1, module.experts.linear_fc2):
-                    linear._npu_mc2_param_sync_hook_id = self.remove_forward_pre_hook_handles[
-                        linear
-                    ].id
+                    linear._npu_mc2_ddp = weakref.ref(self)
