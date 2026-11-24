@@ -361,23 +361,6 @@ register(
     vendor="npu",
 )
 
-register(
-    target=(
-        "megatron.core.transformer.moe.token_dispatcher."
-        "MoEAlltoAllTokenDispatcher.combine_postprocess"
-    ),
-    impl="megatron.plugin.Ascend.transformer.moe.fused_experts.combine_postprocess",
-    vendor="npu",
-)
-
-# Native MC2 consumes grouped weights outside Linear.forward.
-register(
-    target="megatron.core.distributed.distributed_data_parallel.DistributedDataParallel.enable_forward_pre_hook",
-    impl="megatron.plugin.Ascend.distributed.distributed_data_parallel.enable_forward_pre_hook",
-    vendor="npu",
-)
-
-
 # Ascend compressed sparse attention and indexer.
 register(
     target="megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention.DSv4HybridSelfAttention._q_up_proj_and_norm",
