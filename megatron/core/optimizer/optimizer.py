@@ -55,6 +55,7 @@ from .optimizer_config import OptimizerConfig
 logger = getLogger(__name__)
 
 ######## FlagScale Begin ########
+from megatron.plugin.decorators import overridable
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
@@ -623,6 +624,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         return False
 
+    @overridable
+    def _step_inner_optimizer(self):
+        """Execute the inner optimizer with prepared gradients."""
+        return self.optimizer.step()
+
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
@@ -633,7 +639,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            self.optimizer.step()
+            self._step_inner_optimizer()
         if timers is not None:
             timers('optimizer-inner-step').stop()
 

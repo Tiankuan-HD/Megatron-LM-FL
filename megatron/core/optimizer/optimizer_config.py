@@ -341,6 +341,15 @@ class OptimizerConfig:
     # Optimizer Offload
     #######################
 
+    chunked_optimizer_state_offload: bool = False
+    """Enable backend-provided chunked optimizer state staging."""
+
+    optimizer_state_offload_chunk_size_mb: int = 64
+    """Target size in MiB for a group of whole local optimizer shards."""
+
+    optimizer_state_offload_fraction: float = 1.0
+    """Target fraction of local optimizer state bytes selected for staging."""
+
     optimizer_cpu_offload: bool = False
     """If True, offload optimizer states tensor and compute to CPU."""
 
