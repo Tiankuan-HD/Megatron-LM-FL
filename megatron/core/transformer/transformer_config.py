@@ -47,7 +47,6 @@ from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
-    _validate_dsa_kernel_backend_dependencies,
     get_te_version,
     init_method_normal,
     is_te_min_version,
@@ -441,12 +440,11 @@ class TransformerConfig(ModelParallelConfig):
     A value greater than 1 enables cross-layer top-k sharing."""
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
-    dsa_kernel_backend: Literal["none", "cudnn"] | None = None
+    dsa_kernel_backend: Literal["none", "triton", "cudnn"] | None = None
     """Optional fused DSA kernel backend.
-    When unset, DSv4 hybrid uses ``cudnn`` and other attention variants use ``none``.
-    ``none`` disables fused DSA kernels. Explicit ``cudnn`` enables only that backend.
-    Unsupported DSA layouts continue to use the PyTorch fallback."""
-
+    When unset, follows ``apply_dsa_kernel_fusion``: disabled selects ``none``; enabled
+    selects ``triton`` on SM90 or ``cudnn`` on SM100+. An explicit value overrides that flag.
+    Packed THD requires an explicit ``cudnn`` selection on SM90."""
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""
     dsa_indexer_rotate_activation: bool = True
@@ -466,6 +464,15 @@ class TransformerConfig(ModelParallelConfig):
     path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
     backend. The final index scores remain FP32 independently of this option."""
 
+    attention_cp_layout: str = "zigzag"
+    """Physical attention token layout; DSv4 static CP uses contiguous shards."""
+
+    apply_dsa_kernel_fusion: bool = False
+    """If True, use fused DSA sparse-attention kernels. On SM100+ (Blackwell), uses FlashMLA
+    forward + cuDNN DSA backward (requires ``flash_mla`` and ``nvidia-cudnn-frontend``).
+    On SM90 (Hopper), uses Triton-based fused kernels (requires ``triton>=3.0``).
+    When False, falls back to unfused PyTorch implementations."""
+    ######## FlagScale End ########
     ####################
     # linear attention
     ####################
@@ -1395,11 +1402,6 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
 
-        if self.dsa_kernel_backend is None:
-            self.dsa_kernel_backend = (
-                "cudnn" if self.experimental_attention_variant == "dsv4_hybrid" else "none"
-            )
-
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
@@ -1508,7 +1510,6 @@ class TransformerConfig(ModelParallelConfig):
             )
         ######## FlagScale Begin ########
         elif self.experimental_attention_variant == "dsa":
-            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
             if self.dsa_indexer_topk_freq < 1:
                 raise ValueError(
                     f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
@@ -1550,28 +1551,19 @@ class TransformerConfig(ModelParallelConfig):
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
-            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
-            if self.dsa_kernel_backend == "cudnn":
-                sm = torch.cuda.get_device_capability()
-                assert sm[0] >= 9, (
-                    "dsa_kernel_backend='cudnn' requires SM90+ (Hopper or later), "
-                    f"but current device has compute capability {sm[0]}.{sm[1]}."
-                )
-                uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
-                indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
-                if (
-                    sm[0] == 9
-                    and uses_ratio4_indexer
-                    and indexer_loss_enabled
-                    and not self.dsa_indexer_use_sparse_loss
-                ):
-                    raise ValueError(
-                        "DSv4 with fused DSA and dense indexer loss is not supported on SM90 "
-                        "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
-                        "this path. Use sparse indexer loss or set dsa_kernel_backend='none'."
-                    )
             self.hetereogenous_dist_checkpoint = True
 
+        if self.experimental_attention_variant in ("dsa", "dsv4_hybrid"):
+            from megatron.core.transformer.experimental_attention_variant.dsa_backend import (
+                validate_dsa_kernel_backend,
+            )
+
+            validate_dsa_kernel_backend(self)
+            if (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and self.context_parallel_size > 1
+            ):
+                self.attention_cp_layout = "contiguous"
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
             if self.first_last_layers_bf16 and self.fp8_recipe == Fp8Recipe.delayed:
@@ -2809,7 +2801,7 @@ class TransformerConfig(ModelParallelConfig):
                         "full-iteration CUDA graphs"
                     )
 
-        if self.moe_token_dispatcher_type in ["allgather"]:
+        if self.num_moe_experts is not None and self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
                 raise ValueError(
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "

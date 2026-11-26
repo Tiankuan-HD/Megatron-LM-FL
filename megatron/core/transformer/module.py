@@ -492,6 +492,7 @@ class Float16Module(MegatronModule):
             The wrapped module's outputs, potentially upcast to fp32 depending on pipeline stage
             and ``fp32_output``.
         """
+        # isort: off
         from megatron.core.pipeline_parallel.utils import (
             is_dualpipev_first_stage,  # FlagScale Modify
         )
@@ -504,6 +505,8 @@ class Float16Module(MegatronModule):
             is_vp_first_stage,
             is_vp_last_stage,
         )
+
+        # isort: on
 
         if self.pg_collection is None:
             pp_group = parallel_state.get_pipeline_model_parallel_group()

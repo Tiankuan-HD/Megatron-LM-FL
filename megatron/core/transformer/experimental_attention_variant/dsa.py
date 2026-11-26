@@ -22,9 +22,9 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import dsa_backend as dsa_kernels
 from megatron.core.transformer.experimental_attention_variant import (
     dsa_indexer_loss,
-    dsa_kernels,
     dsa_layout,
     dsa_masking,
 )
@@ -391,22 +391,18 @@ class DSAIndexerLossLoggingHelper:
             tracker["values"] = grown
         values = tracker["values"]
 
-        torch.distributed.all_reduce(values, group=pp_group)
         if calculate_per_token_loss is not None:
-            # Every pipeline stage now holds the PP-wide losses, including stages
-            # without a local indexer. Use explicit CP groups on all of them.
             cp_group = pg_collection.cp
-            if get_pg_size(cp_group) > 1:
-                torch.distributed.all_reduce(
-                    values,
-                    group=cp_group,
-                    op=(
-                        torch.distributed.ReduceOp.SUM
-                        if calculate_per_token_loss
-                        else torch.distributed.ReduceOp.AVG
-                    ),
-                )
+            cp_size = get_pg_size(cp_group)
+            if cp_size > 1:
+                # Convert local means to contributions before mixing pipeline stages.
+                # Packed CSA already divides by global tokens and requests a CP sum.
+                if not calculate_per_token_loss and tracker.get("reduce_group") is not cp_group:
+                    values.div_(cp_size)
+                torch.distributed.all_reduce(values, group=cp_group)
+            torch.distributed.all_reduce(values, group=pp_group)
         else:
+            torch.distributed.all_reduce(values, group=pp_group)
             # Compatibility for direct callers that supply reduction groups when
             # saving losses rather than an explicit logging policy.
             if tracker.get('reduce_group') is not None:
@@ -1107,6 +1103,12 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         """
         Fused forward: index_scores never materialized in full.
         """
+        # The fork's public apply ABI placed the per-token flag immediately
+        # after pg_collection. Keep that positional call valid alongside the
+        # upstream optional tensor metadata arguments.
+        if isinstance(varlen_starts, bool):
+            calculate_per_token_loss = varlen_starts
+            varlen_starts = None
         topk_indices, loss = fwd_fused_indexer_loss_naive(
             q,
             weights,
@@ -1766,6 +1768,56 @@ class DSAIndexer(MegatronModule):
         return topk_indices
 
 
+def _unfused_sbhd_dsa_fn(
+    query,
+    key,
+    value,
+    topk_indices,
+    softmax_scale,
+    mask,
+    varlen_starts=None,
+    varlen_ends=None,
+    key_positions=None,
+):
+    """Preserve the fork's SBHD GEMM order with safe invalid-index masking."""
+    sq, batch, heads, dim = query.shape
+    sk = key.shape[0]
+    dv = value.shape[-1]
+    q = query.permute(1, 2, 0, 3).reshape(batch * heads, sq, dim)
+    k = key.permute(1, 2, 3, 0).reshape(batch * heads, dim, sk)
+    scores = (torch.bmm(q.float(), k.float()) * softmax_scale).reshape(batch, heads, sq, sk)
+    selected = torch.full((batch, sq, sk), -torch.inf, device=query.device)
+    dsa_masking.scatter_topk_into_index_mask(selected, topk_indices, seq_chunk_size=256)
+    row_mask, varlen_starts, varlen_ends, key_positions = dsa_masking.prepare_sparse_mask_context(
+        mask=mask,
+        varlen_starts=varlen_starts,
+        varlen_ends=varlen_ends,
+        key_positions=key_positions,
+        sq=sq,
+        sk=sk,
+        b=batch,
+        device=query.device,
+    )
+    selected = dsa_masking.apply_sparse_validity_to_index_mask(
+        selected,
+        row_mask=row_mask,
+        varlen_starts=varlen_starts,
+        varlen_ends=varlen_ends,
+        key_positions=key_positions,
+    )
+    scores = scores + selected.unsqueeze(1)
+    valid = torch.isfinite(selected).unsqueeze(1).expand_as(scores)
+    probabilities = dsa_masking.masked_softmax(scores, valid, dim=-1)
+    v = value.permute(1, 2, 0, 3).reshape(batch * heads, sk, dv)
+    output = torch.bmm(probabilities.reshape(batch * heads, sq, sk).to(value.dtype), v)
+    return (
+        output.reshape(batch, heads, sq, dv)
+        .permute(2, 0, 1, 3)
+        .contiguous()
+        .reshape(sq, batch, heads * dv)
+    )
+
+
 def unfused_dsa_fn(
     query,
     key,
@@ -1785,6 +1837,24 @@ def unfused_dsa_fn(
     """
     if value is None:
         raise NotImplementedError("DSAttention unfused path requires value tensor.")
+
+    if (
+        query.ndim == 4
+        and key.ndim == 4
+        and value.ndim == 4
+        and key.shape[2] == query.shape[2] == value.shape[2]
+    ):
+        return _unfused_sbhd_dsa_fn(
+            query,
+            key,
+            value,
+            topk_indices,
+            softmax_scale,
+            mask,
+            varlen_starts,
+            varlen_ends,
+            key_positions,
+        )
 
     query, query_was_thd = dsa_layout.ensure_sbhd(query, "query")
     key, _ = dsa_layout.ensure_sbhd(key, "key")

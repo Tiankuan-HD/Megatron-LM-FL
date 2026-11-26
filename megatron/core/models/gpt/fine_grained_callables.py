@@ -23,9 +23,10 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_layer_offset,
 )
 from megatron.core.transformer.transformer_layer import (
-    HyperConnectionTransformerLayer,  # FlagScale Modify
+    HyperConnectionTransformerLayer,
+    TransformerLayer,
+    make_viewless_tensor,
 )
-from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import internal_api
 
