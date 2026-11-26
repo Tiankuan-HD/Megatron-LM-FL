@@ -345,8 +345,15 @@ register(
 
 
 register(
-    target="megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils.get_packed_csa_provider",
-    impl="megatron.plugin.Ascend.transformer.experimental_attention_variant.dsa.get_packed_csa_provider",
+    target="megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils.get_packed_csa_backend",
+    impl="megatron.plugin.Ascend.transformer.experimental_attention_variant.dsa.get_packed_csa_backend",
+    vendor="npu",
+)
+
+
+register(
+    target="megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils.apply_dsv4_rope",
+    impl="megatron.plugin.Ascend.transformer.experimental_attention_variant.csa.apply_dsv4_rope",
     vendor="npu",
 )
 

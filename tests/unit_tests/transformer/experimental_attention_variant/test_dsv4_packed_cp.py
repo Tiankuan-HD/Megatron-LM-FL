@@ -470,30 +470,64 @@ def test_packed_cp2_optimizer_steps_match_cp1():
     ],
 )
 def test_packed_provider_checks_only_active_ops(monkeypatch, with_indexer, fused, ops):
+    from unittest.mock import Mock
+
     from megatron.core.transformer.experimental_attention_variant.csa import (
         CompressedSparseAttention,
     )
+    from megatron.plugin.Ascend.transformer.experimental_attention_variant import csa
 
-    layer = SimpleNamespace(
-        training=True,
-        indexer=object() if with_indexer else None,
-        config=SimpleNamespace(dsa_indexer_loss_coeff=0.2, apply_rope_fusion=fused),
-    )
-    seen = []
-    provider = SimpleNamespace(resolve=seen.append)
-    monkeypatch.setattr(cp_utils, "get_packed_csa_provider", lambda device: provider)
-    CompressedSparseAttention.validate_packed_provider(layer, torch.device("cuda"))
-    assert seen == ops
-    monkeypatch.setattr(cp_utils, "get_packed_csa_provider", lambda device: None)
-    CompressedSparseAttention.validate_packed_provider(layer, torch.device("cpu"))
-    assert seen == ops
-
-    def unavailable(op):
-        raise RuntimeError("backend excluded by policy")
-
-    monkeypatch.setattr(
-        cp_utils, "get_packed_csa_provider", lambda device: SimpleNamespace(resolve=unavailable)
-    )
+    layer = Mock(spec=CompressedSparseAttention)
+    layer.training = True
+    layer.indexer = object() if with_indexer else None
+    config = SimpleNamespace(dsa_indexer_loss_coeff=0.2, apply_rope_fusion=fused)
+    manager = Mock()
+    monkeypatch.setattr(csa, "_manager", lambda: manager)
+    csa.validate_backend(config, layer)
+    assert [call.args[0] for call in manager.resolve.call_args_list] == ops
+    manager.resolve.side_effect = RuntimeError("backend excluded by policy")
     with pytest.raises(RuntimeError, match=ops[0]) as error:
-        CompressedSparseAttention.validate_packed_provider(layer, torch.device("cuda"))
+        csa.validate_backend(config, layer)
     assert "excluded by policy" in str(error.value.__cause__)
+
+
+def test_dsv4_rope_default_forwards_original_call():
+    from unittest.mock import Mock
+
+    operation = Mock()
+    inputs = (object(), object(), object(), 32, 64, object(), 3, 4)
+    kwargs = dict(inverse=True, remove_interleaving=True, position_ids=object())
+    result = cp_utils.apply_dsv4_rope.__wrapped__(operation, *inputs, **kwargs)
+    operation.assert_called_once_with(*inputs, **kwargs)
+    assert result is operation.return_value
+
+
+def test_packed_backend_non_npu_preserves_upstream_operators():
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        packed_sparse_attention,
+    )
+    from megatron.plugin.Ascend.transformer.experimental_attention_variant import dsa
+
+    backend = dsa.get_packed_csa_backend(torch.device("cuda"))
+    assert backend is packed_sparse_attention
+    assert backend.attention_with_loss == backend.FusedCSAIndexerSparseAttnFromTopkFunc.apply
+    assert backend.topk_alignment is backend.get_flash_mla_topk_alignment
+    from unittest.mock import Mock
+
+    gathered = Mock()
+    assert backend.gathered_for_loss(gathered) is gathered.detach.return_value
+    gathered.detach.assert_called_once_with()
+
+
+@pytest.mark.parametrize("device,cp_size", [("cuda", 4), ("npu", 4)])
+def test_ascend_rope_delegates_implicit_sharded_positions(device, cp_size):
+    from unittest.mock import Mock
+
+    from megatron.plugin.Ascend.transformer.experimental_attention_variant import csa
+
+    operation = Mock()
+    t = SimpleNamespace(device=SimpleNamespace(type=device))
+    inputs = (t, object(), object(), 32, 64, object(), 2, cp_size, False, True, True, None)
+    result = csa.apply_dsv4_rope(operation, *inputs)
+    operation.assert_called_once_with(*inputs)
+    assert result is operation.return_value

@@ -727,3 +727,17 @@ def indexer_topk(
         scores, lengths, top_k=min(topk, max_seqlen_kv), next_n=1, return_val=False
     )["indices"]
     return packed_layout.sanitize_topk(candidates, scores, lengths, output_width=topk)
+
+
+def validate_backend(config, attention):
+    if config.dsa_kernel_backend != "cudnn":
+        raise ValueError("Packed DSv4 attention requires dsa_kernel_backend='cudnn'.")
+
+
+def gathered_for_loss(tensor):
+    # Fused backward returns gathered gradients through its deferred local edges.
+    return tensor.detach()
+
+
+topk_alignment = get_flash_mla_topk_alignment
+attention_with_loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply

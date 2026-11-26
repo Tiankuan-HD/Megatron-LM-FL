@@ -9,16 +9,22 @@ import torch.distributed as dist
 
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
+
 from megatron.plugin.decorators import overridable
 
-from . import packed_layout
-from .packed_sparse_attention import indexer_topk
+from . import packed_layout, packed_sparse_attention
 
 
 @overridable
-def get_packed_csa_provider(device: torch.device):
-    """Return an optional device operator provider for packed CSA."""
-    return None
+def apply_dsv4_rope(operation, t, *args, **kwargs):
+    """Apply the caller's fused rotation to a DSv4 activation."""
+    return operation(t, *args, **kwargs)
+
+
+@overridable
+def get_packed_csa_backend(device):
+    """Select the operators used with the static packed CSA layout."""
+    return packed_sparse_attention
 
 
 def _thd_cp_position_ids(
@@ -40,39 +46,6 @@ def _thd_cp_position_ids(
     return torch.where(valid_rows, global_rows - sequence_starts, 0)
 
 
-def apply_dsv4_rope_fused(
-    x, cos, sin, nope_dim, pos_dim, cu_seqlens_q=None, *, inverse=False, position_ids=None
-):
-    """Apply DSv4's pairwise rotation using the positions of the supplied rows."""
-    provider = get_packed_csa_provider(x.device)
-    if provider is None:
-        # Sparse attention backward retains its unrotated output.
-        return fused_mla_rope_inplace(
-            x.clone() if inverse else x,
-            cos,
-            sin,
-            nope_dim,
-            pos_dim,
-            cu_seqlens_q,
-            inverse=inverse,
-            remove_interleaving=True,
-            position_ids=position_ids,
-        )
-
-    if cu_seqlens_q is not None and position_ids is None:
-        # The unsharded THD path starts at the beginning of the pack.
-        position_ids = _thd_cp_position_ids(cu_seqlens_q, 0, x.size(0))
-    if position_ids is not None:
-        positions = position_ids.long()
-        cos = cos.index_select(0, positions)
-        sin = sin.index_select(0, positions)
-    else:
-        cos, sin = cos[: x.size(0)], sin[: x.size(0)]
-    content, rotary = x.split((nope_dim, pos_dim), dim=-1)
-    rotated = provider.call("mla_interleaved_rope", rotary, cos, sin, inverse=inverse)
-    return torch.cat((content, rotated), dim=-1)
-
-
 def apply_thd_cp_local_rope_fused(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -88,7 +61,11 @@ def apply_thd_cp_local_rope_fused(
     squeezed_head = x.ndim == 2
     rope_input = x.squeeze(1) if squeezed_batch else x
     rope_input = rope_input.unsqueeze(1) if squeezed_head else rope_input
-    output = apply_dsv4_rope_fused(
+    if inverse:
+        # The fused kernel is in-place, but sparse-attention backward needs its original output.
+        rope_input = rope_input.clone()
+    output = apply_dsv4_rope(
+        fused_mla_rope_inplace,
         rope_input,
         cos,
         sin,
@@ -96,6 +73,7 @@ def apply_thd_cp_local_rope_fused(
         pos_dim,
         cu_seqlens_q=cu_seqlens_padded,
         inverse=inverse,
+        remove_interleaving=True,
         position_ids=_thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0]),
     )
     if squeezed_batch:
@@ -293,15 +271,6 @@ def build_cp_indexer_layout(
     return cu_q_topk, cu_k_topk, q_causal_offsets
 
 
-def packed_indexer_key_ranges(indexer_layout, local_rows, ratio):
-    """Return each local query's first compressed key and causal key count."""
-    cu_q, cu_k, offsets = indexer_layout
-    lengths = packed_layout.build_seq_lens(cu_q, cu_k, local_rows, ratio, offsets)
-    rows = torch.arange(local_rows, device=cu_q.device, dtype=cu_q.dtype)
-    documents = torch.bucketize(rows, cu_q[1:], right=True)
-    return cu_k[documents], lengths
-
-
 def compute_cp_indexer_topk(
     q_indexer_local: torch.Tensor,
     weights_indexer_local: torch.Tensor,
@@ -338,24 +307,7 @@ def compute_cp_indexer_topk(
         )
         return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
 
-    provider = get_packed_csa_provider(q_indexer_local.device)
-    if provider is not None:
-        layout = (cu_q_topk, cu_k_topk, q_causal_offsets)
-        starts, lengths = packed_indexer_key_ranges(layout, l_local, ratio)
-        topk = provider.call(
-            "packed_csa_indexer_topk",
-            q_indexer_local,
-            k_indexer_seq_major,
-            weights_indexer_local,
-            starts,
-            lengths,
-            max_seqlen_kv,
-            topk_width,
-            indexer_softmax_scale,
-        )
-        return topk, layout
-
-    topk, _ = indexer_topk(
+    topk, _ = get_packed_csa_backend(q_indexer_local.device).indexer_topk(
         q_indexer_local,
         k_indexer_seq_major,
         weights_indexer_local,
@@ -371,7 +323,7 @@ def compute_cp_indexer_topk(
     return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
 
 
-def validate_packed_inputs(packed_seq_params, config, cp_group):
+def validate_packed_inputs(packed_seq_params, config, cp_group, attention=None):
     """Validate the static packed contract without modifying any process group.
 
     main represents a runtime CP1 microbatch with cp_group=None. Dynamic CP
@@ -379,10 +331,9 @@ def validate_packed_inputs(packed_seq_params, config, cp_group):
     using a stale build-time group during forward or recompute.
     """
     cu = packed_seq_params.cu_seqlens_q
-    if config.dsa_kernel_backend != "cudnn" and (
-        cu is None or get_packed_csa_provider(cu.device) is None
-    ):
-        raise ValueError("Packed DSv4 attention requires dsa_kernel_backend='cudnn'.")
+    get_packed_csa_backend(cu.device if cu is not None else None).validate_backend(
+        config, attention
+    )
     if config.deterministic_mode:
         raise NotImplementedError(
             "Packed DSv4 attention does not yet support deterministic_mode; "
