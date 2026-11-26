@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
-from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -166,9 +165,6 @@ def _apply_rope(
             total_seq_len, dtype=x.dtype, packed_seq=False, mscale=mscale
         )
         rotary_pos_emb = None
-        assert (
-            fused_mla_rope_inplace is not None
-        ), "Fused MLA RoPE apply is not imported successfully"
     else:
         # Compressed-attention callers instantiate ``YarnRotaryEmbedding``
         # whenever ``compress_ratio > 1`` (regardless of ``config.rope_type``);
@@ -192,16 +188,12 @@ def _apply_rope(
     if squeeze_head:
         x = x.unsqueeze(-2)
     if config.apply_rope_fusion:
-        out = fused_mla_rope_inplace(
+        out = cp_utils.apply_dsv4_rope_fused(
             x,
             rotary_pos_cos,
             rotary_pos_sin,
             nope_dim,
             pos_dim,
-            None,
-            cp_group.rank(),
-            cp_group.size(),
-            remove_interleaving=True,
         )
     else:
         x_nope, x_pe = torch.split(x, [nope_dim, pos_dim], dim=-1)
@@ -668,14 +660,13 @@ class Compressor(MegatronModule):
             cos, sin = self.rotary_pos_emb.get_cached_cos_sin(
                 max_seqlen_q, dtype=compressed.dtype, packed_seq=True, mscale=1.0
             )
-            compressed = fused_mla_rope_inplace(
+            compressed = cp_utils.apply_dsv4_rope_fused(
                 compressed,
                 cos,
                 sin,
                 self.head_dim - self.qk_pos_emb_head_dim,
                 self.qk_pos_emb_head_dim,
                 cu_seqlens_q=cu_seqlens,
-                remove_interleaving=True,
                 position_ids=compressed_position_ids,
             )
         else:
@@ -1070,6 +1061,31 @@ class CompressedSparseAttention(MegatronModule):
             )
         else:
             self.indexer = None
+
+    def validate_packed_provider(self, device):
+        """Resolve operators used by this forward before exchanging the CP halo."""
+        provider = cp_utils.get_packed_csa_provider(device)
+        if provider is None:
+            return
+        use_loss = (
+            self.indexer is not None
+            and self.training
+            and torch.is_grad_enabled()
+            and (self.config.dsa_indexer_loss_coeff or 0.0) > 0
+        )
+        required = ["packed_csa_attention_with_loss" if use_loss else "packed_csa_attention"]
+        if self.indexer is not None:
+            required.extend(("packed_csa_indexer_topk", "hadamard_transform"))
+        if self.config.apply_rope_fusion:
+            required.append("mla_interleaved_rope")
+        for op in required:
+            try:
+                provider.resolve(op)
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"Packed DSv4 requires TE-FL operator '{op}' on {device}. "
+                    "Check the installed TE-FL backend and dispatch policy."
+                ) from error
 
     def backward_dw(self):
         """Compute deferred gradients for the optional compressor and indexer projections."""
@@ -1600,8 +1616,11 @@ class CompressedSparseAttention(MegatronModule):
         # The fused training path owns both CP reduce-scatters. Detach the
         # gathered buffer here and return each local gradient through a
         # branch-local deferred consumer edge below.
+        provider = cp_utils.get_packed_csa_provider(query.device)
         compressed_kv_for_attention = (
-            compressed_kv_rank_major.detach() if use_indexer_loss else compressed_kv_rank_major
+            compressed_kv_rank_major.detach()
+            if use_indexer_loss and provider is None
+            else compressed_kv_rank_major
         )
         kv_full_thd = torch.cat((boundary_kv, kv_local, compressed_kv_for_attention), dim=0)
         # ``kv_full_thd`` stays the autograd input so its cat edge owns dKV.
@@ -1643,7 +1662,7 @@ class CompressedSparseAttention(MegatronModule):
             for_indexer_loss=use_indexer_loss,
             compressed_rows=compressed_kv_rank_major.shape[0],
             cu_seqlens_unpadded=cu_seqlens_q_unpadded,
-            output_alignment=get_flash_mla_topk_alignment(),
+            output_alignment=get_flash_mla_topk_alignment() if provider is None else 1,
         )
         if use_indexer_loss:
             # ---- Step 7a: indexer-loss path ----------------------------------
@@ -1654,42 +1673,66 @@ class CompressedSparseAttention(MegatronModule):
                 compressed_kv_for_loss = torch.index_select(
                     compressed_kv_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
-            k_indexer_for_loss = k_indexer_for_loss.detach()
-            compressed_kv_for_loss = compressed_kv_for_loss.detach()
             loss_divisor = 1 if self.config.calculate_per_token_loss else l_local * cp_size
             if not self.config.calculate_per_token_loss and cu_seqlens_q_unpadded is not None:
                 # Match the reference DSA mean over real query rows. Keep the
                 # scalar on device so padded THD remains CUDA-graph safe.
                 loss_divisor = cu_seqlens_q_unpadded[-1].clamp_min(1)
-            output, indexer_loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
-                query,
-                kv_full_thd,
-                self.attn_sink.float(),
-                topk_idxs,
-                q_indexer_cp,
-                k_indexer_for_loss,
-                weights_indexer_cp,
-                indexer_topk_rank_major,
-                compressed_kv_for_loss,
-                self.softmax_scale,
-                indexer.softmax_scale,
-                indexer_loss_coeff,
-                loss_divisor,
-                sparse_indexer_loss,
-                ratio,
-                max_seqlen_q,
-                indexer_layout,
-                q_padding_mask,
-                local_k_indexer_grad_edge,
-                local_compressed_kv_grad_edge,
-                cp_group,
-                d_window + l_local,
-                seq_to_rank_row if not sparse_indexer_loss else None,
-                indexer_k_rs_state,
-                compressed_kv_rs_state,
-                self.window_size,
-                kv_reconstruction_parts,
-            )
+            if provider is None:
+                output, indexer_loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+                    query,
+                    kv_full_thd,
+                    self.attn_sink.float(),
+                    topk_idxs,
+                    q_indexer_cp,
+                    k_indexer_for_loss.detach(),
+                    weights_indexer_cp,
+                    indexer_topk_rank_major,
+                    compressed_kv_for_loss.detach(),
+                    self.softmax_scale,
+                    indexer.softmax_scale,
+                    indexer_loss_coeff,
+                    loss_divisor,
+                    sparse_indexer_loss,
+                    ratio,
+                    max_seqlen_q,
+                    indexer_layout,
+                    q_padding_mask,
+                    local_k_indexer_grad_edge,
+                    local_compressed_kv_grad_edge,
+                    cp_group,
+                    d_window + l_local,
+                    seq_to_rank_row if not sparse_indexer_loss else None,
+                    indexer_k_rs_state,
+                    compressed_kv_rs_state,
+                    self.window_size,
+                    kv_reconstruction_parts,
+                )
+            else:
+                # The gather autograd edges own both reduce-scatters on this path.
+                key_indices = indexer_topk_rank_major
+                if not sparse_indexer_loss:
+                    starts, lengths = cp_utils.packed_indexer_key_ranges(
+                        indexer_layout, l_local, ratio
+                    )
+                    key_indices = (starts, lengths, max_seqlen_q // ratio)
+                output, indexer_loss = provider.call(
+                    "packed_csa_attention_with_loss",
+                    query,
+                    kv_full_thd,
+                    self.attn_sink,
+                    topk_idxs,
+                    self.softmax_scale,
+                    q_indexer_cp,
+                    k_indexer_for_loss,
+                    weights_indexer_cp,
+                    compressed_kv_for_loss.detach(),
+                    key_indices,
+                    self.window_size,
+                    indexer.softmax_scale,
+                    q_padding_mask,
+                )
+                indexer_loss = indexer_loss * indexer_loss_coeff / loss_divisor
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss,
                 layer_number=self.layer_number,
@@ -1700,16 +1743,26 @@ class CompressedSparseAttention(MegatronModule):
             return output.unsqueeze(1)
 
         # ---- Step 7b: sparse attention path ----------------------------------
-        output = packed_csa_sparse_attn(
-            query,
-            kv_full_thd,
-            self.attn_sink.float(),
-            topk_idxs,
-            self.softmax_scale,
-            topk_length=topk_length,
-            kv_reconstruction_parts=kv_reconstruction_parts,
-            q_padding_mask=q_padding_mask,
-        )
+        if provider is None:
+            output = packed_csa_sparse_attn(
+                query,
+                kv_full_thd,
+                self.attn_sink.float(),
+                topk_idxs,
+                self.softmax_scale,
+                topk_length=topk_length,
+                kv_reconstruction_parts=kv_reconstruction_parts,
+                q_padding_mask=q_padding_mask,
+            )
+        else:
+            output = provider.call(
+                "packed_csa_attention",
+                query,
+                kv_full_thd,
+                self.attn_sink,
+                topk_idxs,
+                self.softmax_scale,
+            )
         if training_with_grad and indexer is not None:
             # Zero loss or a pack without compressed keys still needs explicit
             # indexer gradients, without saving full-size zero gradients in forward.

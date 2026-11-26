@@ -20,6 +20,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
+    CompressedSparseAttention,
     CompressedSparseAttentionBuilder,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
@@ -28,16 +29,6 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import get_pg_size, is_te_min_version
-
-try:
-    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
-        fused_mla_rope_inplace,
-        fused_mla_rope_out_of_place,
-    )
-except Exception:
-    fused_mla_rope_inplace = None
-    fused_mla_rope_out_of_place = None
-
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
@@ -291,6 +282,8 @@ class DSv4HybridAttention(Attention):
         packed_seq = packed_seq_params is not None
         if packed_seq:
             cp_utils.validate_packed_inputs(packed_seq_params, self.config, cp_group)
+            if isinstance(self.core_attention, CompressedSparseAttention):
+                self.core_attention.validate_packed_provider(hidden_states.device)
             if hidden_states.shape[1] != 1:
                 raise ValueError("Packed DSv4 hidden states require a singleton batch dimension.")
         elif cp_size > 1:
@@ -403,9 +396,6 @@ class DSv4HybridAttention(Attention):
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-            assert (
-                fused_mla_rope_inplace is not None
-            ), "Fused MLA RoPE apply is not imported successfully"
         elif self._dsv4_uses_yarn_rope:
             rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
         else:
@@ -429,17 +419,14 @@ class DSv4HybridAttention(Attention):
                 # Fused DSA backward retains the raw attention output O. Applying
                 # inverse RoPE to its view in-place corrupts the retained O used by
                 # the softmax backward, so this call needs private storage.
-                core_attn_out = fused_mla_rope_out_of_place(
+                core_attn_out = cp_utils.apply_dsv4_rope_fused(
                     core_attn_out,
                     rotary_pos_cos,
                     rotary_pos_sin,
                     nope_dim,
                     pos_dim,
                     cu_seqlens_kv,
-                    self.pg_collection.cp.rank(),
-                    self.pg_collection.cp.size(),
                     inverse=True,
-                    remove_interleaving=True,
                 )
                 if packed_seq:
                     core_attn_out = core_attn_out.unsqueeze(1)
@@ -659,9 +646,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-            assert (
-                fused_mla_rope_inplace is not None
-            ), "Fused MLA RoPE apply is not imported successfully"
         elif self._dsv4_uses_yarn_rope:
             rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
@@ -781,29 +765,22 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         boundary_kv = kv[:boundary_rows]
                         kv = kv[boundary_rows:]
                 else:
-                    cp_rank = cp_group.rank()
-                    query = fused_mla_rope_inplace(
+                    query = cp_utils.apply_dsv4_rope_fused(
                         q,
                         rotary_pos_cos,
                         rotary_pos_sin,
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
-                        cp_rank,
-                        cp_size,
-                        remove_interleaving=True,
                     )
                     kv = kv.unsqueeze(-2)
-                    kv = fused_mla_rope_inplace(
+                    kv = cp_utils.apply_dsv4_rope_fused(
                         kv,
                         rotary_pos_cos,
                         rotary_pos_sin,
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
-                        cp_rank,
-                        cp_size,
-                        remove_interleaving=True,
                     )
                 key = kv
                 value = kv

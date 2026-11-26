@@ -4,12 +4,9 @@
 
 import torch
 
-# At dim=128, six FP32 scratch stages use 192 MiB per chunk.
-_HADAMARD_CHUNK_ROWS = 65536
-
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    """Rotate the last dimension, bounding the Ascend kernel's FP32 scratch."""
+    """Rotate the last dimension, using the Ascend provider."""
     if x.device.type != "npu":
         from megatron.core.transformer.experimental_attention_variant.dsa import (
             rotate_activation as original,
@@ -17,17 +14,20 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
         return original.__wrapped__(x)
 
-    from flag_gems import hadamard_transform
+    from transformer_engine.plugin.core.manager import get_default_manager
 
     assert (
         x.dtype == torch.bfloat16
     ), f"rotate_activation only support bf16 input, but got {x.dtype}"
     if x.numel() == 0:
         return x.clone()
-    hidden_size = x.size(-1)
-    flat = x.reshape(-1, hidden_size)
-    outputs = [
-        hadamard_transform(chunk, scale=hidden_size**-0.5)
-        for chunk in flat.split(_HADAMARD_CHUNK_ROWS, dim=0)
-    ]
-    return torch.cat(outputs, dim=0).reshape(x.shape)
+    return get_default_manager().call("hadamard_transform", x, scale=x.size(-1) ** -0.5)
+
+
+def get_packed_csa_provider(device: torch.device):
+    """Resolve device compute through the TE-FL registry for Ascend tensors."""
+    if device.type == "npu":
+        from transformer_engine.plugin.core.manager import get_default_manager
+
+        return get_default_manager()
+    return None

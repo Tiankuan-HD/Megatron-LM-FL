@@ -344,6 +344,13 @@ register(
 )
 
 
+register(
+    target="megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils.get_packed_csa_provider",
+    impl="megatron.plugin.Ascend.transformer.experimental_attention_variant.dsa.get_packed_csa_provider",
+    vendor="npu",
+)
+
+
 # Ascend expert-parallel communication/computation fusion.
 register(
     target="megatron.core.transformer.moe.moe_layer.MoELayer.compute_experts",

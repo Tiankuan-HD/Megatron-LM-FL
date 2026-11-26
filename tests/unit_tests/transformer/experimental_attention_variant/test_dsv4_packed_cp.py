@@ -451,3 +451,49 @@ def test_packed_cp2_optimizer_steps_match_cp1():
         assert any(not torch.equal(before[name], value) for name, value in model.named_parameters())
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "with_indexer,fused,ops",
+    [
+        (False, False, ["packed_csa_attention"]),
+        (
+            True,
+            True,
+            [
+                "packed_csa_attention_with_loss",
+                "packed_csa_indexer_topk",
+                "hadamard_transform",
+                "mla_interleaved_rope",
+            ],
+        ),
+    ],
+)
+def test_packed_provider_checks_only_active_ops(monkeypatch, with_indexer, fused, ops):
+    from megatron.core.transformer.experimental_attention_variant.csa import (
+        CompressedSparseAttention,
+    )
+
+    layer = SimpleNamespace(
+        training=True,
+        indexer=object() if with_indexer else None,
+        config=SimpleNamespace(dsa_indexer_loss_coeff=0.2, apply_rope_fusion=fused),
+    )
+    seen = []
+    provider = SimpleNamespace(resolve=seen.append)
+    monkeypatch.setattr(cp_utils, "get_packed_csa_provider", lambda device: provider)
+    CompressedSparseAttention.validate_packed_provider(layer, torch.device("cuda"))
+    assert seen == ops
+    monkeypatch.setattr(cp_utils, "get_packed_csa_provider", lambda device: None)
+    CompressedSparseAttention.validate_packed_provider(layer, torch.device("cpu"))
+    assert seen == ops
+
+    def unavailable(op):
+        raise RuntimeError("backend excluded by policy")
+
+    monkeypatch.setattr(
+        cp_utils, "get_packed_csa_provider", lambda device: SimpleNamespace(resolve=unavailable)
+    )
+    with pytest.raises(RuntimeError, match=ops[0]) as error:
+        CompressedSparseAttention.validate_packed_provider(layer, torch.device("cuda"))
+    assert "excluded by policy" in str(error.value.__cause__)
