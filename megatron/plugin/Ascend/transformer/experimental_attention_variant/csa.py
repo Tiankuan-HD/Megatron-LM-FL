@@ -10,6 +10,14 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import (
 )
 
 
+def get_packed_csa_backend(device):
+    if device is None or device.type != "npu":
+        return cp_utils.get_packed_csa_backend.__wrapped__(device)
+    from megatron.plugin.Ascend.transformer.experimental_attention_variant import csa
+
+    return csa
+
+
 def _manager():
     from transformer_engine.plugin.core.manager import get_default_manager
 
@@ -66,13 +74,10 @@ def apply_dsv4_rope(
 
 
 def validate_backend(config, attention):
-    from megatron.core.transformer.experimental_attention_variant.csa import (
-        CompressedSparseAttention,
-    )
-
-    if not isinstance(attention, CompressedSparseAttention):
+    # Standalone metadata validation has no module-specific dependencies.
+    if attention is None:
         return
-    use_indexer = attention.indexer is not None
+    use_indexer = getattr(attention, "indexer", None) is not None
     use_loss = (
         use_indexer
         and attention.training
@@ -94,6 +99,15 @@ def validate_backend(config, attention):
 
 def topk_alignment():
     return 1
+
+
+def defer_reduce_scatter_wait(tensor, range_name):
+    """Gather autograd owns dK/dKV reduce-scatter for the Ascend loss path.
+
+    Together with gathered_for_loss, this leaves a single gradient route to
+    each local producer. TE backward does not consume deferred local edges.
+    """
+    return None, None
 
 
 def gathered_for_loss(tensor):
@@ -180,6 +194,7 @@ def attention_with_loss(
     logical_window_width,
     kv_reconstruction_parts,
 ):
+    """Use gather autograd instead of the default backend's deferred RS inputs."""
     keys = indexer_topk_idxs
     if not sparse_loss:
         starts, lengths = _key_ranges(*indexer_layout, query.size(0), ratio)

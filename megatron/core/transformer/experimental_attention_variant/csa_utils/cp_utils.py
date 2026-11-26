@@ -9,7 +9,6 @@ import torch.distributed as dist
 
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
-
 from megatron.plugin.decorators import overridable
 
 from . import packed_layout, packed_sparse_attention
@@ -23,7 +22,11 @@ def apply_dsv4_rope(operation, t, *args, **kwargs):
 
 @overridable
 def get_packed_csa_backend(device):
-    """Select the operators used with the static packed CSA layout."""
+    """Select packed operators and their gradient-ownership contract.
+
+    gathered_for_loss and defer_reduce_scatter_wait must agree on whether
+    loss backward or gather autograd returns gradients to local producers.
+    """
     return packed_sparse_attention
 
 
@@ -282,6 +285,7 @@ def compute_cp_indexer_topk(
     topk_width: int,
     indexer_softmax_scale: float,
     max_seqlen_q: int,
+    backend=None,
 ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
     """Return local top-k and its local-Q/full-K packed layout."""
     topk_width = int(topk_width)
@@ -307,7 +311,9 @@ def compute_cp_indexer_topk(
         )
         return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
 
-    topk, _ = get_packed_csa_backend(q_indexer_local.device).indexer_topk(
+    if backend is None:
+        backend = get_packed_csa_backend(q_indexer_local.device)
+    topk, _ = backend.indexer_topk(
         q_indexer_local,
         k_indexer_seq_major,
         weights_indexer_local,
@@ -323,17 +329,19 @@ def compute_cp_indexer_topk(
     return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
 
 
-def validate_packed_inputs(packed_seq_params, config, cp_group, attention=None):
-    """Validate the static packed contract without modifying any process group.
+def validate_packed_inputs(packed_seq_params, config, cp_group, attention=None, device=None):
+    """Validate the static packed contract and return its execution backend.
 
     main represents a runtime CP1 microbatch with cp_group=None. Dynamic CP
     transitions are a separate integration; reject them instead of accidentally
-    using a stale build-time group during forward or recompute.
+    using a stale build-time group during forward or recompute. Module callers
+    supply the compute device for provider preflight before communication.
     """
     cu = packed_seq_params.cu_seqlens_q
-    get_packed_csa_backend(cu.device if cu is not None else None).validate_backend(
-        config, attention
-    )
+    if device is None and cu is not None:
+        device = cu.device
+    backend = get_packed_csa_backend(device)
+    backend.validate_backend(config, attention)
     if config.deterministic_mode:
         raise NotImplementedError(
             "Packed DSv4 attention does not yet support deterministic_mode; "
@@ -386,3 +394,4 @@ def validate_packed_inputs(packed_seq_params, config, cp_group, attention=None):
             (physical_q == physical_kv).all(),
             "Packed CSA requires matching physical Q/KV document boundaries.",
         )
+    return backend

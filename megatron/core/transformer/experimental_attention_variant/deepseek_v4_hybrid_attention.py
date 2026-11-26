@@ -291,7 +291,7 @@ class DSv4HybridAttention(Attention):
         packed_seq = packed_seq_params is not None
         if packed_seq:
             cp_utils.validate_packed_inputs(
-                packed_seq_params, self.config, cp_group, self.core_attention
+                packed_seq_params, self.config, cp_group, self.core_attention, hidden_states.device
             )
             if hidden_states.shape[1] != 1:
                 raise ValueError("Packed DSv4 hidden states require a singleton batch dimension.")

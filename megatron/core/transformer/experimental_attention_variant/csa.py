@@ -41,7 +41,6 @@ from .csa_utils.fused_sparse_attention import (
     fused_csa_indexer_sparse_attn,
     indexer_topk,
 )
-from .csa_utils.packed_sparse_attention import defer_reduce_scatter_wait
 
 #: Bit-exact determinism status for the eager CSA operations introduced here.
 #: The operations use CUDA reductions and indexed accumulation, but bit-exact
@@ -1217,7 +1216,9 @@ class CompressedSparseAttention(MegatronModule):
             output: [sq, b, np * v_head_dim]
         """
         if packed_seq_params is not None:
-            cp_utils.validate_packed_inputs(packed_seq_params, self.config, self.pg_collection.cp)
+            backend = cp_utils.validate_packed_inputs(
+                packed_seq_params, self.config, self.pg_collection.cp, self, query.device
+            )
             if attention_mask is not None:
                 raise ValueError(
                     "Packed CSA uses its document and causal metadata, not attention_mask."
@@ -1233,7 +1234,7 @@ class CompressedSparseAttention(MegatronModule):
                 boundary_hidden = x.new_empty((0, *x.shape[1:]))
                 boundary_kv = key.new_empty((0, *key.shape[1:]))
             return self._forward_packed(
-                query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params
+                query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params, backend
             )
         if attention_mask is not None:
             raise ValueError(
@@ -1390,6 +1391,7 @@ class CompressedSparseAttention(MegatronModule):
         boundary_hidden: Optional[torch.Tensor],
         boundary_kv: Optional[torch.Tensor],
         packed_seq_params: PackedSeqParams,
+        backend=None,
     ) -> torch.Tensor:
         """THD-packed context-parallel branch.
 
@@ -1398,6 +1400,10 @@ class CompressedSparseAttention(MegatronModule):
         """
         # ---- Step 1: CP metadata and THD shape contract ----------------------
         cp_group = self.pg_collection.cp
+        if backend is None:
+            backend = cp_utils.validate_packed_inputs(
+                packed_seq_params, self.config, cp_group, self, query.device
+            )
         cp_size = cp_group.size()
         cp_rank = cp_group.rank()
 
@@ -1476,11 +1482,10 @@ class CompressedSparseAttention(MegatronModule):
                     compressed_position_ids=compressed_position_ids,
                 )
                 nvtx_range_pop("dsv4_cp_indexer_k_compressor")
-                # Build this edge before the independent attention
-                # compressor and indexer projection branches. Their newer
-                # backward nodes can then run while Indexer-K RS completes.
-                # The zero-loss and inference paths simply never consume it.
-                local_k_indexer_grad_edge, indexer_k_rs_state = defer_reduce_scatter_wait(
+                # A backend using deferred RS builds its consumer edge before
+                # independent backward nodes so they can overlap the wait.
+                # A backend using gather autograd returns no deferred edge.
+                local_k_indexer_grad_edge, indexer_k_rs_state = backend.defer_reduce_scatter_wait(
                     indexer_compressed_local.squeeze(1),
                     "dsv4_cp_indexer_k_reduce_scatter_consumer_wait",
                 )
@@ -1503,12 +1508,13 @@ class CompressedSparseAttention(MegatronModule):
             )
             nvtx_range_pop("dsv4_cp_attention_kv_compressor")
             if indexer is not None:
-                # Create this edge before the independent indexer projection
-                # nodes. Autograd then executes those newer backward nodes
-                # before this edge waits for the compressed-KV RS.
-                local_compressed_kv_grad_edge, compressed_kv_rs_state = defer_reduce_scatter_wait(
-                    compressed_kv_local.squeeze(1),
-                    "dsv4_cp_attention_kv_reduce_scatter_consumer_wait",
+                # Deferred RS backends create the KV consumer before indexer
+                # projection, allowing its newer backward nodes to run first.
+                local_compressed_kv_grad_edge, compressed_kv_rs_state = (
+                    backend.defer_reduce_scatter_wait(
+                        compressed_kv_local.squeeze(1),
+                        "dsv4_cp_attention_kv_reduce_scatter_consumer_wait",
+                    )
                 )
                 # Queue the attention-KV gather as soon as its local producer
                 # completes. Indexer-K was enqueued first on every CP rank, so
@@ -1578,6 +1584,7 @@ class CompressedSparseAttention(MegatronModule):
                     indexer.index_topk,
                     indexer.softmax_scale,
                     max_seqlen_q=max_seqlen_q,
+                    backend=backend,
                 )
                 nvtx_range_pop("dsv4_cp_indexer_topk")
 
@@ -1594,10 +1601,8 @@ class CompressedSparseAttention(MegatronModule):
         )
 
         # ---- Step 6: concatenate the raw local KV sources -------------------
-        # The fused training path owns both CP reduce-scatters. Detach the
-        # gathered buffer here and return each local gradient through a
-        # branch-local deferred consumer edge below.
-        backend = cp_utils.get_packed_csa_backend(query.device)
+        # The backend pairs gathered_for_loss with its local gradient edges:
+        # fused backward owns deferred RS, or gather autograd owns the gradient.
         compressed_kv_for_attention = (
             backend.gathered_for_loss(compressed_kv_rank_major)
             if use_indexer_loss

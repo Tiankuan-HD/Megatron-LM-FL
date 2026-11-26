@@ -506,9 +506,9 @@ def test_packed_backend_non_npu_preserves_upstream_operators():
     from megatron.core.transformer.experimental_attention_variant.csa_utils import (
         packed_sparse_attention,
     )
-    from megatron.plugin.Ascend.transformer.experimental_attention_variant import dsa
+    from megatron.plugin.Ascend.transformer.experimental_attention_variant import csa
 
-    backend = dsa.get_packed_csa_backend(torch.device("cuda"))
+    backend = csa.get_packed_csa_backend(torch.device("cuda"))
     assert backend is packed_sparse_attention
     assert backend.attention_with_loss == backend.FusedCSAIndexerSparseAttnFromTopkFunc.apply
     assert backend.topk_alignment is backend.get_flash_mla_topk_alignment
@@ -531,3 +531,92 @@ def test_ascend_rope_delegates_implicit_sharded_positions(device, cp_size):
     result = csa.apply_dsv4_rope(operation, *inputs)
     operation.assert_called_once_with(*inputs)
     assert result is operation.return_value
+
+
+@pytest.mark.parametrize("with_indexer", [False, True])
+def test_packed_provider_accepts_builder_compatible_module(monkeypatch, with_indexer):
+    from unittest.mock import Mock
+
+    from megatron.plugin.Ascend.transformer.experimental_attention_variant import csa
+
+    layer = SimpleNamespace(indexer=object() if with_indexer else None, training=True)
+    config = SimpleNamespace(dsa_indexer_loss_coeff=0.2, apply_rope_fusion=False)
+    manager = Mock()
+    monkeypatch.setattr(csa, "_manager", lambda: manager)
+    csa.validate_backend(config, layer)
+    expected = (
+        ["packed_csa_attention_with_loss", "packed_csa_indexer_topk", "hadamard_transform"]
+        if with_indexer
+        else ["packed_csa_attention"]
+    )
+    assert [call.args[0] for call in manager.resolve.call_args_list] == expected
+
+
+def test_packed_validation_selects_compute_device_and_returns_backend(monkeypatch):
+    from unittest.mock import Mock
+
+    cu = torch.tensor([0, 4], dtype=torch.int32)
+    packed = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=4, max_seqlen_kv=4
+    )
+    config = SimpleNamespace(deterministic_mode=False, attention_cp_layout="contiguous")
+    attention = object()
+    backend = Mock()
+    select = Mock(return_value=backend)
+    monkeypatch.setattr(cp_utils, "get_packed_csa_backend", select)
+    compute_device = torch.device("cuda", 1)
+    assert (
+        cp_utils.validate_packed_inputs(packed, config, _CP1(), attention, compute_device)
+        is backend
+    )
+    select.assert_called_once_with(compute_device)
+    backend.validate_backend.assert_called_once_with(config, attention)
+
+
+def test_ascend_gather_gradient_contract_uses_original_autograd_edge():
+    from megatron.plugin.Ascend.transformer.experimental_attention_variant import csa
+
+    tensor = object()
+    assert csa.gathered_for_loss(tensor) is tensor
+    assert csa.defer_reduce_scatter_wait(tensor, "consumer_wait") == (None, None)
+
+
+def test_direct_packed_attention_preflights_before_execution(monkeypatch):
+    from unittest.mock import Mock
+
+    from megatron.core.transformer.experimental_attention_variant.csa import (
+        CompressedSparseAttention,
+    )
+
+    layer = SimpleNamespace(config=object(), pg_collection=SimpleNamespace(cp=_CP1()))
+    query = SimpleNamespace(device=torch.device("cuda", 1))
+    packed = object()
+    validate = Mock(side_effect=RuntimeError("missing active provider"))
+    monkeypatch.setattr(cp_utils, "validate_packed_inputs", validate)
+    with pytest.raises(RuntimeError, match="missing active provider"):
+        CompressedSparseAttention.forward(layer, query, None, None, None, packed_seq_params=packed)
+    validate.assert_called_once_with(
+        packed, layer.config, layer.pg_collection.cp, layer, query.device
+    )
+
+
+def test_cp_indexer_topk_reuses_selected_backend(monkeypatch):
+    from unittest.mock import Mock
+
+    q = torch.empty(2, 1, 4)
+    k = torch.empty(1, 4)
+    weights = torch.empty(2, 1)
+    cu_q = torch.tensor([0, 2], dtype=torch.int32)
+    cu_k = torch.tensor([0, 1], dtype=torch.int32)
+    offsets = torch.tensor([0], dtype=torch.int32)
+    backend = Mock()
+    backend.indexer_topk.return_value = (object(), None)
+    select = Mock(side_effect=AssertionError("backend was selected twice"))
+    monkeypatch.setattr(cp_utils, "get_packed_csa_backend", select)
+    monkeypatch.setattr(cp_utils, "build_cp_indexer_layout", lambda *args: (cu_q, cu_k, offsets))
+    result, _ = cp_utils.compute_cp_indexer_topk(
+        q, weights, k, cu_q, cu_k, 0, 4, 1, 1.0, 4, backend=backend
+    )
+    assert result is backend.indexer_topk.return_value[0]
+    backend.indexer_topk.assert_called_once()
+    select.assert_not_called()

@@ -730,12 +730,13 @@ def indexer_topk(
 
 
 def validate_backend(config, attention):
+    """Require the upstream cuDNN provider for packed attention."""
     if config.dsa_kernel_backend != "cudnn":
         raise ValueError("Packed DSv4 attention requires dsa_kernel_backend='cudnn'.")
 
 
 def gathered_for_loss(tensor):
-    # Fused backward returns gathered gradients through its deferred local edges.
+    """Route gathered gradients through fused backward's deferred local edges."""
     return tensor.detach()
 
 
