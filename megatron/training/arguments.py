@@ -52,6 +52,7 @@ from megatron.core.quantization.utils import (
     load_quantization_recipe,
 )
 
+from megatron.plugin.decorators import overridable
 from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
@@ -395,6 +396,13 @@ def tuple_type(x):
         return x
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
+
+@overridable
+def _validate_optimizer_state_offload_args(args):
+    """Validate backend-provided optimizer state offload options."""
+    if getattr(args, "chunked_optimizer_state_offload", False):
+        raise ValueError("Chunked optimizer state offload is not supported by this backend")
+
 
 def validate_args(args, defaults={}):
 
@@ -1667,6 +1675,8 @@ def validate_args(args, defaults={}):
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
+
+    _validate_optimizer_state_offload_args(args)
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2569,6 +2579,12 @@ def _add_training_args(parser):
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')
+    group.add_argument('--chunked-optimizer-state-offload', action='store_true',
+                       help='Stage selected optimizer states in chunks on the training device.')
+    group.add_argument('--optimizer-state-offload-chunk-size-mb', type=int, default=64,
+                       help='Target size in MiB of a chunk of whole local optimizer shards.')
+    group.add_argument('--optimizer-state-offload-fraction', type=float, default=1.0,
+                       help='Target fraction of local optimizer state bytes offloaded to CPU.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-cuda-graph', action='store_true',

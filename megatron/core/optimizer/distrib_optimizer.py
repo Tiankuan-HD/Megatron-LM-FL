@@ -62,6 +62,7 @@ from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 ######## FlagScale Begin ########
+from megatron.plugin.decorators import overridable  # isort: skip
 from megatron.plugin.platform import get_platform  # isort: skip
 
 cur_platform = get_platform()
@@ -693,6 +694,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             "due to checkpointing requirements."
         )
 
+        if config.chunked_optimizer_state_offload and self.ddp_config.use_megatron_fsdp:
+            raise ValueError("Chunked optimizer state offload does not support Megatron-FSDP")
+
         # when freezing sub-models we have no real optimizer
         # but still need a stub DistributedOptimizer class
         if optimizer is None:
@@ -786,6 +790,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+        self._configure_optimizer_state_offload()
+
+    @overridable
+    def _configure_optimizer_state_offload(self):
+        """Configure optional state management after local shards are established."""
+        if (
+            self.config.chunked_optimizer_state_offload
+            and self.config.optimizer_state_offload_fraction
+        ):
+            raise ValueError("Chunked optimizer state offload is not supported by this backend")
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """

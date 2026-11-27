@@ -366,3 +366,20 @@ register(
     impl="megatron.plugin.Ascend.transformer.moe.fused_experts.dispatch_preprocess",
     vendor="npu",
 )
+
+# Ascend chunked optimizer state staging.
+register(
+    target="megatron.core.optimizer.distrib_optimizer.DistributedOptimizer._configure_optimizer_state_offload",
+    impl="megatron.plugin.Ascend.optimizer.chunked_optimizer_state_offload.configure_optimizer_state_offload",
+    vendor="npu",
+)
+register(
+    target="megatron.core.optimizer.optimizer.MixedPrecisionOptimizer._step_inner_optimizer",
+    impl="megatron.plugin.Ascend.optimizer.chunked_optimizer_state_offload.step_inner_optimizer",
+    vendor="npu",
+)
+register(
+    target="megatron.training.arguments._validate_optimizer_state_offload_args",
+    impl="megatron.plugin.Ascend.optimizer.chunked_optimizer_state_offload.validate_optimizer_state_offload_args",
+    vendor="npu",
+)
